@@ -8,4 +8,4 @@
 # Mises à jour proposées chaque semaine par Dependabot (.github/dependabot.yml),
 # dbt-core et dbt-snowflake ensemble.
 dbt-core==1.12.5
-dbt-snowflake==1.12.1
+dbt-snowflake==1.12.2
