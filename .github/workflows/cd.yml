@@ -31,6 +31,9 @@
 #   dbt-run-results-prod run_results.json + sources.json (toujours)
 #   dbt-docs             documentation autonome static_index.html
 #                        (dbt docs generate --static)
+# puis, si le run de production a réussi, le job `documentation` publie
+# cette documentation sur GitHub Pages :
+#   https://abrahamkoloboe27.github.io/fintrack-analytics-intermediaire/
 #
 # Un seul run de production à la fois (groupe `dbt-prod`) : un run en
 # cours n'est jamais annulé, les suivants attendent leur tour (queue: max).
@@ -381,3 +384,35 @@ jobs:
           path: target/docs/static_index.html
           retention-days: 30
           if-no-files-found: error
+
+      - name: Préparer le site GitHub Pages
+        # static_index.html embarque manifest et catalog : un seul fichier,
+        # servi comme page d'accueil du site.
+        run: |
+          mkdir -p site
+          cp target/docs/static_index.html site/index.html
+
+      - name: Publier le site pour GitHub Pages
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  documentation:
+    name: Documentation (GitHub Pages)
+    # Uniquement après un run de production réussi : le site reflète
+    # toujours ce qui est réellement en production.
+    needs: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write      # déployer sur GitHub Pages
+      id-token: write   # jeton OIDC exigé par actions/deploy-pages
+    # Environnement créé par GitHub à l'activation de Pages (source :
+    # GitHub Actions) ; seule la branche main est autorisée à y déployer.
+    environment:
+      name: github-pages
+      url: ${{ steps.deploiement.outputs.page_url }}
+    steps:
+      - name: Déployer la documentation dbt sur GitHub Pages
+        id: deploiement
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -7,6 +7,9 @@
 | 3. Preuve d'historisation (snapshot) | [`preuve_historisation.md`](preuve_historisation.md) |
 | 4. Rapport (20-25 lignes) | [`rapport.md`](rapport.md) |
 
+Documentation dbt de la production, publiée par la CD sur GitHub Pages : https://abrahamkoloboe27.github.io/fintrack-analytics-intermediaire/
+(vue « Lineage Graph » : bouton en bas à droite de la page).
+
 ## Capture du lineage
 
 `dbt docs generate --static`, vue « Lineage Graph » du projet complet. Les tests singuliers et les tests unitaires sont masqués pour la lisibilité (`--exclude test_type:singular file:_fct_schema.yml`). La chaîne visible :
