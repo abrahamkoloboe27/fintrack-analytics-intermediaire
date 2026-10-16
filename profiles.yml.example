@@ -1,9 +1,38 @@
 # ============================================================
 # FICHIER EXEMPLE — à copier vers ~/.dbt/profiles.yml
-# Remplacez les valeurs entre < > par vos informations
+# Remplacez les valeurs entre < > par vos informations.
+# Ce fichier est versionné : n'y écrivez JAMAIS de vrais identifiants.
+# ============================================================
+#
+# La clé de premier niveau doit être identique à `profile:` dans
+# dbt_project.yml : `finetrack_analytics` (orthographe historique
+# conservée volontairement, c'est la clé des profils déjà en place).
+#
+# Isolation dev / prod (Partie 8.2)
+# ---------------------------------
+# - target `dev` (target par défaut) : TOUT ce que vous construisez
+#   atterrit dans votre schéma personnel (ex. DEV_ABRAHAM). La macro
+#   generate_schema_name ignore les schémas personnalisés (staging,
+#   marts, raw, snapshots) hors prod : vous pouvez tout reconstruire
+#   (--full-refresh, snapshots de test...) sans toucher aux données
+#   lues par les dashboards. Seules les tables sources de RAW sont
+#   partagées, en lecture.
+# - target `prod` : réservée au déploiement continu (GitHub Actions,
+#   voir ci/profiles.yml) ou, exceptionnellement, à un lancement manuel
+#   explicite avec `--target prod`. Les objets vont dans les schémas
+#   définitifs STAGING / MARTS / RAW (seeds) / SNAPSHOTS.
+# - Les identifiants de prod ne sont jamais écrits en clair : ils sont
+#   lus dans des variables d'environnement via env_var() (secrets
+#   GitHub en CI/CD). Sans valeur par défaut, dbt s'arrête avec une
+#   erreur explicite si une variable manque.
+# - Bonne pratique complémentaire : un utilisateur de service dédié à la
+#   prod, seul autorisé à écrire dans STAGING / MARTS / SNAPSHOTS ; les
+#   comptes des développeurs n'y ont qu'un droit de lecture.
+# - query_tag différent par environnement : les requêtes de chaque
+#   target se retrouvent facilement dans QUERY_HISTORY (coûts, audit).
 # ============================================================
 
-fintrack_analytics:
+finetrack_analytics:
   target: dev
   outputs:
 
@@ -11,17 +40,33 @@ fintrack_analytics:
       type: snowflake
       account: '<votre_compte>'           # ex : xy12345.eu-west-1
       user: '<votre_utilisateur>'
-      password: '<votre_mot_de_passe>'
+      password: '<votre_mot_de_passe>'    # ou : "{{ env_var('SNOWFLAKE_PASSWORD') }}"
       role: 'FINTRACK_ROLE'
       database: 'FINTRACK_DB'
       warehouse: 'FINTRACK_WH'
-      schema: 'DEV_VOTRENOM'              # schéma personnel pour le dev
+      schema: 'DEV_VOTRENOM'              # schéma personnel pour le dev (ex : DEV_ABRAHAM)
       threads: 2
+      query_tag: 'dbt_fintrack_dev'
 
-    # TODO (Partie 2 — Section 8.2) : configurer la target prod
-    # prod:
-    #   type: snowflake
-    #   account: '<votre_compte>'
-    #   ...
-    #   schema: 'MARTS'
-    #   threads: 4
+    # Mêmes variables d'environnement que la target prod de ci/profiles.yml.
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      # Alternative recommandée pour un utilisateur de service (Snowflake
+      # bloque progressivement le mot de passe seul) : paire de clés, à la
+      # place de `password` :
+      # private_key_path: '<chemin/vers/cle_privee.p8>'    # fichier local
+      # private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY') }}"   # ou contenu PEM (comme en CI)
+      # private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'FINTRACK_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'FINTRACK_DB') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'FINTRACK_WH') }}"
+      # Schéma par défaut des objets sans schéma personnalisé. En prod,
+      # les schémas personnalisés (staging, marts, raw, snapshots) sont
+      # utilisés tels quels par generate_schema_name.
+      schema: 'MARTS'
+      threads: 4
+      connect_retries: 3                  # nouvelles tentatives sur erreur réseau transitoire
+      query_tag: 'dbt_fintrack_prod_local'  # la CD GitHub utilise dbt_fintrack_prod_<run_id>

@@ -2,6 +2,10 @@ packages:
   - package: dbt-labs/dbt_utils
     version: [">=1.0.0", "<2.0.0"]
 
-  # TODO (Partie 2 — Section 6.1) : ajouter dbt-expectations ici
-  - package: calogica/dbt_expectations
-  #   version: ...
+  # Partie 2 — Section 6.1 : dbt-expectations
+  # Le dépôt historique calogica/dbt_expectations est archivé : le hub dbt
+  # redirige vers le fork maintenu metaplane/dbt_expectations.
+  # La série 0.10.x (>= 0.10.10) déclare require-dbt-version [">=1.7.0", "<3.0.0"],
+  # compatible avec dbt-core 1.12. Elle tire godatadriven/dbt_date en dépendance.
+  - package: metaplane/dbt_expectations
+    version: [">=0.10.0", "<0.11.0"]

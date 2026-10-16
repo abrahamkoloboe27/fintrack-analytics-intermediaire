@@ -1,8 +1,34 @@
-name: 'finetrack_analytics'
+# ============================================================
+# FinTrack Analytics — Partie 2 (dbt-core + Snowflake)
+# ============================================================
+
+# Nom du projet : il DOIT être identique à la clé utilisée sous
+# `models:` / `seeds:` / `snapshots:` plus bas. L'ancien nom
+# `finetrack_analytics` ne correspondait pas à ces clés
+# (`fintrack_analytics`) : dbt ignorait alors tous ces blocs (schémas,
+# matérialisations, tags...), avec pour seul signal un avertissement
+# « Configuration paths exist ... which do not apply to any resources »
+# facile à manquer.
+name: 'fintrack_analytics'
 version: '2.0.0'
 config-version: 2
 
+# Le profil garde volontairement l'orthographe historique
+# `finetrack_analytics` : c'est la clé déjà présente dans
+# ~/.dbt/profiles.yml (poste local) et dans ci/profiles.yml (GitHub
+# Actions). Nom du projet et nom du profil sont indépendants : renommer
+# le profil obligerait à modifier tous les profils existants.
 profile: 'finetrack_analytics'
+
+# Version minimale réellement requise : 1.10.5
+#   - propriété `arguments:` des tests génériques (dbt >= 1.10.5) ;
+#   - godatadriven/dbt_date 0.21.0 (dépendance de dbt_expectations)
+#     exige lui-même dbt >= 1.10.5 ;
+#   - déjà couverts : snapshots en YAML + hard_deletes (1.9),
+#     unit_tests et data_tests (1.8).
+# Borne haute < 2.0.0 : dbt Fusion (2.x) est un autre moteur, non validé
+# sur ce projet.
+require-dbt-version: [">=1.10.5", "<2.0.0"]
 
 model-paths: ["models"]
 analysis-paths: ["analyses"]
@@ -10,22 +36,108 @@ test-paths: ["tests"]
 seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
+# Doc blocks ({% docs %}) : page d'accueil __overview__ et descriptions
+# de colonnes réutilisables, rangées uniquement dans docs/.
+docs-paths: ["docs"]
 
 clean-targets:
   - "target"
   - "dbt_packages"
 
+
+# ------------------------------------------------------------
+# Variables du projet
+# ------------------------------------------------------------
+vars:
+  # Fenêtre de recouvrement (en jours) des modèles incrémentaux : chaque
+  # run retraite les lignes dont la date métier est >= max(date déjà
+  # chargée) - N jours, pour rattraper les données arrivées en retard.
+  # Surcharge ponctuelle :
+  #   dbt run -s fct_transactions --vars '{lookback_jours_transactions: 7}'
+  lookback_jours_transactions: 3
+  lookback_jours_virements: 3
+
+
+# ------------------------------------------------------------
+# Hooks de projet (Partie 7.1)
+# ------------------------------------------------------------
+# Une ligne par exécution dans <schéma marts de la target>.dbt_run_log
+# (prod : FINTRACK_DB.MARTS.dbt_run_log). La macro ne journalise que
+# run / build / seed / snapshot / test et renvoie un `select` neutre
+# sinon (ex. `dbt source freshness`, qui exécute aussi les hooks).
+on-run-end:
+  - "{{ journaliser_fin_run(results) }}"
+
+
+# ------------------------------------------------------------
+# Modèles
+# ------------------------------------------------------------
+# Les schémas `+schema` passent par macros/generate_schema_name.sql :
+#   - target prod   -> schéma utilisé tel quel (STAGING, MARTS...) ;
+#   - autres targets -> tout dans le schéma de la target (DEV_<NOM>, CI_PR_<n>).
 models:
   fintrack_analytics:
+    # persist_docs : les descriptions des YAML (et des doc blocks)
+    # deviennent des COMMENT Snowflake sur les tables, vues et colonnes.
+    # Elles sont ainsi visibles dans Snowsight et par les outils BI
+    # (Metabase, cf. exposures) sans ouvrir dbt docs. Coût négligeable :
+    # quelques requêtes de métadonnées par modèle. dbt-snowflake encadre
+    # les textes par $$...$$ : les apostrophes du français ne posent
+    # aucun problème.
+    +persist_docs:
+      relation: true
+      columns: true
+    # copy_grants : Snowflake reconstruit tables et vues par
+    # CREATE OR REPLACE, ce qui supprime les droits accordés hors dbt
+    # (ex. GRANT SELECT au rôle d'un dashboard) à chaque run. COPY GRANTS
+    # recopie ces droits sur le nouvel objet, sans privilège
+    # supplémentaire requis. Sans effet en dev / ci, utile en prod (y
+    # compris lors d'un --full-refresh des modèles incrémentaux).
+    +copy_grants: true
+
     staging:
       +materialized: view
       +schema: staging
+      +tags: ['daily']
     intermediate:
       +materialized: ephemeral
     marts:
+      # Pas de tag au niveau du dossier : chaque modèle déclare ses
+      # propres tags (daily / weekly / critical) dans son config(),
+      # utilisés par les sélecteurs de selectors.yml.
       +materialized: table
       +schema: marts
 
+
+# ------------------------------------------------------------
+# Seeds (données de référence)
+# ------------------------------------------------------------
 seeds:
   fintrack_analytics:
+    # En prod : FINTRACK_DB.RAW, à côté des tables sources.
     +schema: raw
+    +tags: ['weekly']
+    # En-têtes CSV repris sans guillemets -> colonnes insensibles à la
+    # casse dans Snowflake (défaut de dbt-snowflake, rendu explicite ici).
+    +quote_columns: false
+    +persist_docs:
+      relation: true
+      columns: true
+    # Pas de copy_grants : un seed n'est jamais recréé par
+    # CREATE OR REPLACE (INSERT OVERWRITE en temps normal, DROP + CREATE
+    # avec --full-refresh), l'option n'aurait aucun effet.
+
+
+# ------------------------------------------------------------
+# Snapshots (SCD Type 2)
+# ------------------------------------------------------------
+snapshots:
+  fintrack_analytics:
+    # En prod : FINTRACK_DB.SNAPSHOTS ; en dev / ci : schéma de la target.
+    +schema: snapshots
+    +tags: ['daily']
+    +persist_docs:
+      relation: true
+      columns: true
+    # Pas de copy_grants : la table d'historique est créée une seule fois
+    # puis alimentée par MERGE, ses droits sont conservés.

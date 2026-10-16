@@ -1,0 +1,71 @@
+# ============================================================
+# SÉLECTEURS YAML (Partie 9.2 — bonus)
+# ============================================================
+# Un sélecteur donne un nom à une sélection de nœuds, versionnée avec le
+# projet, au lieu de répéter `-s tag:...` dans chaque commande ou job :
+#   dbt build --selector daily       # équivalent de : dbt build -s tag:daily
+#   dbt ls --selector critical       # liste ce qui serait exécuté, sans rien lancer
+#
+# Les tags sont posés dans dbt_project.yml (dossier staging, seeds,
+# snapshots), dans _stg_sources.yml (source fintrack_raw) et dans le
+# config() de chaque modèle marts :
+#   daily    → sources RAW (pour leurs tests), staging, snapshot snap_comptes,
+#              dim_comptes, dim_categories, fct_transactions, fct_virements,
+#              mart_budget_vs_reel, mart_solde_mensuel
+#   weekly   → seeds (mapping_groupes, seuils_alerte), dim_comptes_historique
+#   critical → fct_transactions, fct_virements, mart_solde_mensuel
+#              (le sélecteur critical y ajoute les vues staging en amont :
+#              voir sa définition)
+# Les tests suivent les nœuds sélectionnés (sélection indirecte « eager »,
+# comportement par défaut de dbt).
+#
+# Aucun sélecteur n'a `default: true` : sans --selector, dbt garde son
+# comportement standard (tout le projet). Les sélecteurs daily et weekly
+# sont utilisés par les runs planifiés de la CD GitHub Actions
+# (.github/workflows/cd.yml) ; les trois sont proposés en lancement manuel.
+# ============================================================
+
+selectors:
+
+  - name: daily
+    description: >
+      Run quotidien : nœuds tagués daily (sources RAW, modèles staging,
+      snapshot des comptes, dimensions, faits incrémentaux, marts) et leurs
+      tests, dont les tests des sources.
+    definition:
+      method: tag
+      value: daily
+
+  - name: weekly
+    description: >
+      Run hebdomadaire : nœuds tagués weekly (seeds de référence,
+      historique des comptes dim_comptes_historique) et leurs tests.
+    definition:
+      method: tag
+      value: weekly
+
+  - name: critical
+    description: >
+      Nœuds critiques pour la fiabilité des soldes (fct_transactions,
+      fct_virements, mart_solde_mensuel) et leurs tests, à relancer en
+      priorité après un incident. Inclut aussi les vues staging en amont
+      et leurs tests (unique, not_null...) : dans un dbt build, ils
+      s'exécutent avant les faits et les bloquent en cas d'échec (ex. clé
+      en double dans RAW).
+    definition:
+      union:
+        # 1. Les nœuds tagués critical (et leurs tests)
+        - method: tag
+          value: critical
+        # 2. Leurs ancêtres matérialisés en vue (stg_transactions,
+        #    stg_comptes, stg_categories, stg_virements), pour embarquer
+        #    leurs tests : dans un dbt build, un test ne bloque les nœuds en
+        #    aval que s'il fait partie de la sélection, et ni le MERGE ni le
+        #    --full-refresh ne contrôlent l'unicité des clés. Ni seed, ni
+        #    snapshot : uniquement des vues, recréées sans déplacer de données.
+        - intersection:
+            - method: tag
+              value: critical
+              parents: true
+            - method: config.materialized
+              value: view
