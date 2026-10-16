@@ -1,0 +1,53 @@
+version: 2
+
+# ============================================================
+# COUCHE INTERMEDIATE — documentation
+# ============================================================
+# Modèle éphémère : aucun objet n'est créé dans Snowflake, dbt injecte
+# son SQL sous forme de CTE dans les modèles qui le référencent
+# (fct_transactions). Pas de persist_docs (aucune relation) ni de test
+# de données ici : les clés et les valeurs sont déjà testées sur les
+# modèles staging en amont et sur fct_transactions en aval.
+# ============================================================
+
+models:
+  - name: int_transactions_enrichies
+    description: >-
+      Transactions enrichies — 1 ligne par transaction, TOUS statuts confondus
+      (le filtre statut = 'validee' est appliqué dans fct_transactions). Ajoute
+      à stg_transactions la clé mensuelle `periode` (macro generer_periode), le
+      client et le type du compte (stg_comptes), le libellé, la nature et le
+      groupe de la catégorie (stg_categories). LEFT JOIN : une transaction n'est
+      jamais perdue si son compte ou sa catégorie manque au référentiel.
+      Matérialisation éphémère (CTE injectée dans fct_transactions).
+    columns:
+      - name: transaction_id
+        description: "Identifiant unique de la transaction"
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+      - name: date_transaction
+        description: "Date et heure de la transaction (timestamp sans fuseau, date métier)"
+      - name: montant
+        description: "Montant de la transaction en euros, toujours positif : le sens est porté par type_operation"
+      - name: montant_signe
+        description: "{{ doc('col_montant_signe') }}"
+      - name: type_operation
+        description: "Sens de l'opération : credit (entrée d'argent) ou debit (sortie d'argent)"
+      - name: categorie_id
+        description: "Catégorie de la transaction (référence stg_categories.categorie_id)"
+      - name: description
+        description: "Libellé libre de la transaction"
+      - name: statut
+        description: "Statut de traitement : validee, en_attente ou rejetee"
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+      - name: nom_client
+        description: "Nom complet du titulaire du compte (stg_comptes)"
+      - name: type_compte
+        description: "Type de compte : courant, epargne ou joint (stg_comptes)"
+      - name: nom_categorie
+        description: "Libellé de la catégorie (stg_categories)"
+      - name: type_categorie
+        description: "Nature de la catégorie : revenu ou depense (stg_categories)"
+      - name: groupe
+        description: "Groupe de la catégorie (ex. Logement, Épargne), clé de jointure avec le seed mapping_groupes"

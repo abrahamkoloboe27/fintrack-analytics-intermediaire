@@ -1,0 +1,548 @@
+version: 2
+
+# ============================================================
+# Faits incrémentaux : fct_transactions et fct_virements
+# (dimensions et agrégats : voir _marts_schema.yml).
+# Syntaxe dbt >= 1.10 : `data_tests:`, arguments des tests génériques
+# sous `arguments:`, configuration des tests sous `config:`.
+#
+# « Date pas dans le futur » : les dates sources sont des timestamp_ntz
+# (heure locale métier, Europe/Paris pour FinTrack). On compare donc à
+# l'heure courante de Paris, convertie en ntz :
+#   convert_timezone('Europe/Paris', current_timestamp())::timestamp_ntz
+# et non à current_timestamp()::timestamp_ntz, qui dépend du paramètre
+# TIMEZONE de la session (America/Los_Angeles par défaut sur Snowflake :
+# faux positifs sur les dernières heures), ni à sysdate() (UTC : faux
+# positifs sur les 1 à 2 dernières heures). dbt_expectations injecte
+# max_value tel quel dans `<colonne> <= <max_value>` : l'expression doit
+# donc être du SQL Snowflake valide. Si la source passe en UTC, utiliser
+# sysdate() à la place.
+# ============================================================
+
+models:
+  # ----------------------------------------------------------
+  # fct_transactions
+  # ----------------------------------------------------------
+  - name: fct_transactions
+    description: >-
+      Faits : une ligne par transaction VALIDÉE (les statuts en_attente et rejetee
+      sont exclus), enrichie du client et de la catégorie. Modèle incrémental
+      (merge sur transaction_id) : fenêtre de recouvrement (lookback) de N jours sur
+      date_transaction (var lookback_jours_transactions, défaut 3) + anti-jointure
+      pour insérer les transactions validées tardivement, quelle que soit leur date.
+      Reconstruit chaque semaine en --full-refresh (annulations après coup,
+      corrections hors fenêtre).
+    data_tests:
+      # Partie 6.2 : montant_signe négatif pour les débits, positif pour les crédits
+      - dbt_utils.expression_is_true:
+          name: fct_transactions_signe_coherent_avec_type_operation
+          arguments:
+            expression: "(type_operation = 'debit' and montant_signe < 0) or (type_operation = 'credit' and montant_signe > 0)"
+      # Macro convertir_centimes : conversion exacte (montants à 2 décimales)
+      - dbt_utils.expression_is_true:
+          name: fct_transactions_centimes_coherents
+          arguments:
+            expression: "montant_centimes = montant * 100 and montant_signe_centimes = montant_signe * 100"
+    columns:
+      - name: transaction_id
+        description: "Identifiant unique de la transaction : clé du MERGE incrémental."
+        data_tests:
+          - unique
+          - not_null
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_comptes')
+                field: compte_id
+      - name: categorie_id
+        description: "Identifiant de la catégorie de la transaction."
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_categories')
+                field: categorie_id
+      - name: date_transaction
+        description: >-
+          Date et heure de la transaction (timestamp_ntz, heure locale métier).
+          Colonne de marqueur incrémental, avec une fenêtre de recouvrement (lookback)
+          de N jours.
+        data_tests:
+          - not_null
+          # Partie 6.2 : date de transaction pas dans le futur (voir l'en-tête du fichier)
+          - dbt_expectations.expect_column_values_to_be_between:
+              name: fct_transactions_date_transaction_pas_dans_le_futur
+              arguments:
+                max_value: "convert_timezone('Europe/Paris', current_timestamp())::timestamp_ntz"
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              name: fct_transactions_periode_format_aaaa_mm
+              arguments:
+                regex: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      - name: montant
+        description: "Montant de la transaction en euros, toujours strictement positif (le sens est porté par type_operation)."
+        data_tests:
+          - not_null
+          # Partie 6.2 : montants strictement positifs
+          - dbt_expectations.expect_column_values_to_be_between:
+              name: fct_transactions_montant_strictement_positif
+              arguments:
+                min_value: 0
+                strictly: true
+      - name: montant_centimes
+        description: "{{ doc('col_montant_centimes') }}"
+        data_tests:
+          - not_null
+      - name: montant_signe
+        description: "{{ doc('col_montant_signe') }}"
+        data_tests:
+          - not_null
+      - name: montant_signe_centimes
+        description: "Montant signé exprimé en centimes (entier) : macro convertir_centimes appliquée à montant_signe."
+        data_tests:
+          - not_null
+      - name: type_operation
+        description: "Sens de l'opération : credit (entrée d'argent) ou debit (sortie d'argent)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['credit', 'debit']
+      - name: nom_client
+        description: "Nom du titulaire du compte, copié au chargement (rafraîchi hors fenêtre par le --full-refresh hebdomadaire)."
+      - name: nom_categorie
+        description: "Libellé de la catégorie, copié au chargement."
+      - name: groupe
+        description: "Groupe de la catégorie (Logement, Quotidien, Épargne, Loisirs, Revenus, Divers), copié au chargement."
+      - name: statut
+        description: "Statut de la transaction : toujours 'validee' dans cette table (contrat du modèle)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['validee']
+      - name: date_chargement
+        description: "{{ doc('col_date_chargement') }}"
+        data_tests:
+          - not_null
+
+  # ----------------------------------------------------------
+  # fct_virements
+  # ----------------------------------------------------------
+  - name: fct_virements
+    description: >-
+      Faits : mouvements des virements internes EXÉCUTÉS, deux lignes par virement
+      (partie double) : 'sortant' pour le compte source (montant_signe = -montant),
+      'entrant' pour le compte destination (montant_signe = +montant), enrichies des
+      noms du titulaire et de la contrepartie. Modèle incrémental (merge sur
+      mouvement_id) : fenêtre de recouvrement (lookback) de N jours sur date_virement
+      (var lookback_jours_virements, défaut 3) + anti-jointure sur virement_id pour
+      les exécutions tardives. Reconstruit chaque semaine en --full-refresh.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          name: fct_virements_un_mouvement_par_virement_et_sens
+          arguments:
+            combination_of_columns:
+              - virement_id
+              - sens
+      # Partie 6.2 : compte source ≠ compte destination
+      - dbt_utils.expression_is_true:
+          name: fct_virements_comptes_source_destination_distincts
+          arguments:
+            expression: "compte_source_id <> compte_destination_id"
+      # Chaque jambe est cohérente avec son sens (compte impacté, contrepartie, signe)
+      - dbt_utils.expression_is_true:
+          name: fct_virements_jambes_coherentes_avec_sens
+          arguments:
+            expression: >-
+              (sens = 'sortant' and compte_id = compte_source_id
+                and compte_contrepartie_id = compte_destination_id and montant_signe = -montant)
+              or (sens = 'entrant' and compte_id = compte_destination_id
+                and compte_contrepartie_id = compte_source_id and montant_signe = montant)
+      - dbt_utils.expression_is_true:
+          name: fct_virements_centimes_coherents
+          arguments:
+            expression: "montant_centimes = montant * 100 and montant_signe_centimes = montant_signe * 100"
+    columns:
+      - name: mouvement_id
+        description: "Clé du mouvement : hash de (virement_id, sens) via dbt_utils.generate_surrogate_key. Clé du MERGE incrémental."
+        data_tests:
+          - unique
+          - not_null
+      - name: virement_id
+        description: "Identifiant du virement d'origine (deux mouvements par virement)."
+        data_tests:
+          - not_null
+      - name: sens
+        description: "Sens du mouvement pour compte_id : sortant (compte source débité) ou entrant (compte destination crédité)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['sortant', 'entrant']
+      - name: compte_id
+        description: "Compte impacté par le mouvement : compte source pour 'sortant', compte destination pour 'entrant'."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_comptes')
+                field: compte_id
+      - name: nom_client
+        description: "Nom du titulaire de compte_id (stg_comptes)."
+      - name: type_compte
+        description: "Type du compte impacté : courant, epargne ou joint."
+      - name: compte_contrepartie_id
+        description: "Compte à l'autre extrémité du virement : destination pour 'sortant', source pour 'entrant'."
+        data_tests:
+          - not_null
+      - name: nom_client_contrepartie
+        description: "Nom du titulaire du compte de contrepartie."
+      - name: compte_source_id
+        description: "Compte débité par le virement (identique sur les deux mouvements)."
+        data_tests:
+          - not_null
+      - name: compte_destination_id
+        description: "Compte crédité par le virement (identique sur les deux mouvements)."
+        data_tests:
+          - not_null
+      - name: montant
+        description: "Montant du virement en euros, strictement positif, identique sur les deux mouvements."
+        data_tests:
+          - not_null
+          # Partie 6.2 : montant > 0
+          - dbt_expectations.expect_column_values_to_be_between:
+              name: fct_virements_montant_strictement_positif
+              arguments:
+                min_value: 0
+                strictly: true
+      - name: montant_centimes
+        description: "{{ doc('col_montant_centimes') }}"
+        data_tests:
+          - not_null
+      - name: montant_signe
+        # -montant pour 'sortant', +montant pour 'entrant' : somme nulle par virement
+        description: "{{ doc('col_montant_signe') }}"
+        data_tests:
+          - not_null
+      - name: montant_signe_centimes
+        description: "Montant signé exprimé en centimes (entier) : macro convertir_centimes appliquée à montant_signe."
+        data_tests:
+          - not_null
+      - name: date_virement
+        description: >-
+          Date et heure de l'ordre de virement (timestamp_ntz, heure locale métier).
+          La source n'a pas de date d'exécution distincte : un virement exécuté après
+          coup conserve cette date, et donc la période (periode) de son ordre. Colonne
+          de marqueur incrémental, avec une fenêtre de recouvrement (lookback) de N jours.
+        data_tests:
+          - not_null
+          # Une date future fausserait le marqueur incrémental
+          - dbt_expectations.expect_column_values_to_be_between:
+              name: fct_virements_date_virement_pas_dans_le_futur
+              arguments:
+                max_value: "convert_timezone('Europe/Paris', current_timestamp())::timestamp_ntz"
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              name: fct_virements_periode_format_aaaa_mm
+              arguments:
+                regex: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      - name: motif
+        description: "Libellé libre du virement (null si vide à la source)."
+      - name: statut
+        description: "Statut du virement : toujours 'execute' dans cette table (contrat du modèle)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['execute']
+      - name: date_chargement
+        description: "{{ doc('col_date_chargement') }}"
+        data_tests:
+          - not_null
+
+# ============================================================
+# Tests unitaires (dbt >= 1.8)
+# ------------------------------------------------------------
+# Toutes les entrées sont au format `sql` :
+#   - obligatoire pour int_transactions_enrichies (modèle éphémère) ;
+#   - choisi aussi pour `this`, stg_virements et stg_comptes : en format
+#     dict, dbt lirait les colonnes des relations dans l'entrepôt (elles
+#     devraient alors déjà exister) ; en sql, aucune relation n'est lue.
+#   - en format sql, la fixture remplace entièrement la relation : elle
+#     fournit donc TOUTES les colonnes, typées explicitement.
+# Seules les colonnes listées dans `expect` sont comparées, sans tenir
+# compte de l'ordre des lignes (date_chargement = sysdate() est exclue).
+# Les modèles incrémentaux imposent la surcharge booléenne `is_incremental`
+# et, quand elle vaut true, une entrée `this` (contenu actuel de la table).
+# La fenêtre est figée à 3 jours via `overrides.vars` : le test ne dépend
+# pas de la valeur de la variable dans dbt_project.yml.
+# Pré-requis d'exécution : une connexion Snowflake et le schéma cible
+# existant (dbt y crée une table temporaire) ; `dbt build` le crée, pas
+# `dbt test` seul. Aucune table du projet n'a besoin d'exister.
+# Lancer : dbt test --select test_type:unit                 (tous)
+#          dbt test --select "fct_transactions,test_type:unit"  (un modèle)
+# ============================================================
+unit_tests:
+  - name: fct_transactions_incremental_fenetre_et_validation_tardive
+    description: >-
+      Mode incrémental. Marqueur = max(date_transaction) de this = 20/06/2024 10:00,
+      fenêtre de 3 jours → re-sélection à partir du 17/06/2024 10:00 (inclus).
+      Attendu : 1 (marqueur), 2 (déjà chargée, dans la fenêtre : montant corrigé à la
+      source 450 → 460, que le MERGE appliquera), 3 (borne incluse), 6 (ancienne,
+      validée tardivement, absente de this : anti-jointure), 7 (nouvelle).
+      Exclues : 4 (déjà chargée, 1 seconde avant la fenêtre), 5 (déjà chargée,
+      ancienne), 8 / 10 (en_attente, y compris absente de this : le filtre de statut
+      prime sur l'anti-jointure), 9 (rejetee, dans la fenêtre).
+    model: fct_transactions
+    overrides:
+      macros:
+        is_incremental: true
+      vars:
+        lookback_jours_transactions: 3
+    given:
+      - input: ref('int_transactions_enrichies')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as transaction_id,
+              column2::number(38, 0)   as compte_id,
+              column3::timestamp_ntz   as date_transaction,
+              column4::number(10, 2)   as montant,
+              column5::number(10, 2)   as montant_signe,
+              column6::varchar         as type_operation,
+              column7::number(38, 0)   as categorie_id,
+              column8::varchar         as description,
+              column9::varchar         as statut,
+              column10::varchar        as periode,
+              column11::varchar        as nom_client,
+              column12::varchar        as type_compte,
+              column13::varchar        as nom_categorie,
+              column14::varchar        as type_categorie,
+              column15::varchar        as groupe
+          from values
+              (1,  1, '2024-06-20 10:00:00', 600.00,  -600.00,  'debit',  9, 'Épargne mensuelle',  'validee',    '2024-06', 'Alice Dupont', 'courant', 'Épargne versée', 'depense', 'Épargne'),
+              (2,  2, '2024-06-18 16:00:00', 460.00,   460.00,  'credit', 2, 'Mission freelance',  'validee',    '2024-06', 'Bob Martin',   'courant', 'Freelance',      'revenu',  'Revenus'),
+              (3,  4, '2024-06-17 10:00:00', 210.30,  -210.30,  'debit',  3, 'Courses familiales', 'validee',    '2024-06', 'David Moreau', 'joint',   'Alimentation',   'depense', 'Quotidien'),
+              (4,  4, '2024-06-17 09:59:59', 88.00,   -88.00,   'debit',  6, 'EDF facture juin',   'validee',    '2024-06', 'David Moreau', 'joint',   'Électricité',    'depense', 'Logement'),
+              (5,  1, '2024-05-02 09:00:00', 2850.00,  2850.00, 'credit', 1, 'Salaire mai',        'validee',    '2024-05', 'Alice Dupont', 'courant', 'Salaire',        'revenu',  'Revenus'),
+              (6,  1, '2024-03-12 19:00:00', 55.00,   -55.00,   'debit',  7, 'Restaurant Sushi',   'validee',    '2024-03', 'Alice Dupont', 'courant', 'Restaurant',     'depense', 'Loisirs'),
+              (7,  2, '2024-06-21 09:00:00', 9.99,    -9.99,    'debit',  8, 'Spotify',            'validee',    '2024-06', 'Bob Martin',   'courant', 'Abonnements',    'depense', 'Loisirs'),
+              (8,  2, '2024-06-21 12:00:00', 42.00,   -42.00,   'debit',  7, 'Restaurant Wok',     'en_attente', '2024-06', 'Bob Martin',   'courant', 'Restaurant',     'depense', 'Loisirs'),
+              (9,  1, '2024-06-19 20:00:00', 28.00,   -28.00,   'debit',  7, 'Pizza',              'rejetee',    '2024-06', 'Alice Dupont', 'courant', 'Restaurant',     'depense', 'Loisirs'),
+              (10, 2, '2024-02-12 20:00:00', 35.00,   -35.00,   'debit',  7, 'Kebab',              'en_attente', '2024-02', 'Bob Martin',   'courant', 'Restaurant',     'depense', 'Loisirs')
+      - input: this
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as transaction_id,
+              column2::number(38, 0)   as compte_id,
+              column3::number(38, 0)   as categorie_id,
+              column4::timestamp_ntz   as date_transaction,
+              column5::varchar         as periode,
+              column6::number(10, 2)   as montant,
+              column7::number(38, 0)   as montant_centimes,
+              column8::number(10, 2)   as montant_signe,
+              column9::number(38, 0)   as montant_signe_centimes,
+              column10::varchar        as type_operation,
+              column11::varchar        as nom_client,
+              column12::varchar        as nom_categorie,
+              column13::varchar        as groupe,
+              column14::varchar        as statut,
+              column15::timestamp_ntz  as date_chargement
+          from values
+              (1, 1, 9, '2024-06-20 10:00:00', '2024-06', 600.00,  60000,  -600.00, -60000, 'debit',  'Alice Dupont', 'Épargne versée', 'Épargne',   'validee', '2024-06-21 05:00:00'),
+              (2, 2, 2, '2024-06-18 16:00:00', '2024-06', 450.00,  45000,   450.00,  45000, 'credit', 'Bob Martin',   'Freelance',      'Revenus',   'validee', '2024-06-21 05:00:00'),
+              (3, 4, 3, '2024-06-17 10:00:00', '2024-06', 210.30,  21030,  -210.30, -21030, 'debit',  'David Moreau', 'Alimentation',   'Quotidien', 'validee', '2024-06-21 05:00:00'),
+              (4, 4, 6, '2024-06-17 09:59:59', '2024-06', 88.00,   8800,   -88.00,  -8800,  'debit',  'David Moreau', 'Électricité',    'Logement',  'validee', '2024-06-21 05:00:00'),
+              (5, 1, 1, '2024-05-02 09:00:00', '2024-05', 2850.00, 285000, 2850.00, 285000, 'credit', 'Alice Dupont', 'Salaire',        'Revenus',   'validee', '2024-05-03 05:00:00')
+    expect:
+      rows:
+        - {transaction_id: 1, montant: 600.00}
+        - {transaction_id: 2, montant: 460.00}
+        - {transaction_id: 3, montant: 210.30}
+        - {transaction_id: 6, montant: 55.00}
+        - {transaction_id: 7, montant: 9.99}
+
+  - name: fct_transactions_full_refresh_validees_et_centimes
+    description: >-
+      Mode full-refresh (premier run ou --full-refresh) : la table cible n'est pas lue,
+      toutes les transactions validées sont retenues (en_attente et rejetee exclues) et
+      les montants sont convertis en centimes avec leur signe (macro convertir_centimes).
+    model: fct_transactions
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('int_transactions_enrichies')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as transaction_id,
+              column2::number(38, 0)   as compte_id,
+              column3::timestamp_ntz   as date_transaction,
+              column4::number(10, 2)   as montant,
+              column5::number(10, 2)   as montant_signe,
+              column6::varchar         as type_operation,
+              column7::number(38, 0)   as categorie_id,
+              column8::varchar         as description,
+              column9::varchar         as statut,
+              column10::varchar        as periode,
+              column11::varchar        as nom_client,
+              column12::varchar        as type_compte,
+              column13::varchar        as nom_categorie,
+              column14::varchar        as type_categorie,
+              column15::varchar        as groupe
+          from values
+              (1, 1, '2024-06-01 09:00:00', 2850.00, 2850.00, 'credit', 1, 'Salaire juin', 'validee',    '2024-06', 'Alice Dupont', 'courant', 'Salaire',     'revenu',  'Revenus'),
+              (2, 1, '2024-06-15 10:00:00', 15.99,   -15.99,  'debit',  8, 'Netflix',      'validee',    '2024-06', 'Alice Dupont', 'courant', 'Abonnements', 'depense', 'Loisirs'),
+              (3, 1, '2024-06-16 19:00:00', 55.00,   -55.00,  'debit',  7, 'Restaurant',   'en_attente', '2024-06', 'Alice Dupont', 'courant', 'Restaurant',  'depense', 'Loisirs'),
+              (4, 2, '2024-06-12 20:00:00', 28.00,   -28.00,  'debit',  7, 'Pizza',        'rejetee',    '2024-06', 'Bob Martin',   'courant', 'Restaurant',  'depense', 'Loisirs')
+    expect:
+      rows:
+        - {transaction_id: 1, montant_centimes: 285000, montant_signe_centimes: 285000}
+        - {transaction_id: 2, montant_centimes: 1599, montant_signe_centimes: -1599}
+
+  - name: fct_virements_deux_mouvements_par_virement_execute
+    description: >-
+      Mode full-refresh : 1 virement exécuté + 1 annulé + 1 en attente → exactement
+      2 mouvements, tous deux issus du virement exécuté : 'sortant' sur le compte
+      source (montant négatif) et 'entrant' sur le compte destination (montant
+      positif), avec les noms du titulaire et de la contrepartie.
+    model: fct_virements
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('stg_virements')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as virement_id,
+              column2::number(38, 0)   as compte_source_id,
+              column3::number(38, 0)   as compte_destination_id,
+              column4::number(10, 2)   as montant,
+              column5::timestamp_ntz   as date_virement,
+              column6::varchar         as motif,
+              column7::varchar         as statut
+          from values
+              (1, 1, 3, 300.00, '2024-01-15 10:00:00', 'Épargne mensuelle janvier', 'execute'),
+              (6, 1, 2, 75.00,  '2024-03-10 09:00:00', 'Partage abonnement',        'en_attente'),
+              (7, 4, 1, 200.00, '2024-03-20 11:30:00', 'Remboursement courses',     'annule')
+      - input: ref('stg_comptes')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as compte_id,
+              column2::varchar         as nom_client,
+              column3::varchar         as email,
+              column4::varchar         as type_compte,
+              column5::date            as date_ouverture,
+              column6::number(12, 2)   as solde_initial,
+              column7::varchar         as statut
+          from values
+              (1, 'Alice Dupont', 'alice.dupont@email.fr', 'courant', '2023-01-15', 2500.00, 'actif'),
+              (2, 'Bob Martin',   'bob.martin@email.fr',   'courant', '2023-03-22', 1800.00, 'actif'),
+              (3, 'Claire Leroy', 'claire.leroy@email.fr', 'epargne', '2023-06-01', 5000.00, 'actif'),
+              (4, 'David Moreau', 'david.moreau@email.fr', 'joint',   '2022-11-10', 3200.00, 'actif')
+    expect:
+      rows:
+        - {virement_id: 1, sens: sortant, compte_id: 1, nom_client: Alice Dupont, compte_contrepartie_id: 3, nom_client_contrepartie: Claire Leroy, montant_signe: -300.00, periode: '2024-01'}
+        - {virement_id: 1, sens: entrant, compte_id: 3, nom_client: Claire Leroy, compte_contrepartie_id: 1, nom_client_contrepartie: Alice Dupont, montant_signe: 300.00, periode: '2024-01'}
+
+  - name: fct_virements_incremental_fenetre_et_execution_tardive
+    description: >-
+      Mode incrémental. Marqueur = max(date_virement) de this = 20/02/2024 10:00,
+      fenêtre de 3 jours → re-sélection à partir du 17/02/2024 10:00.
+      Attendu (2 mouvements chacun) : 9 (marqueur) et 10 (déjà chargé, dans la
+      fenêtre), 6 (ancien, exécuté tardivement, absent de this : anti-jointure sur
+      virement_id), 5 (nouveau). Exclus : 4 (déjà chargé, hors fenêtre), 7 (annulé).
+    model: fct_virements
+    overrides:
+      macros:
+        is_incremental: true
+      vars:
+        lookback_jours_virements: 3
+    given:
+      - input: ref('stg_virements')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as virement_id,
+              column2::number(38, 0)   as compte_source_id,
+              column3::number(38, 0)   as compte_destination_id,
+              column4::number(10, 2)   as montant,
+              column5::timestamp_ntz   as date_virement,
+              column6::varchar         as motif,
+              column7::varchar         as statut
+          from values
+              (9,  4, 3, 500.00, '2024-02-20 10:00:00', 'Épargne famille février',  'execute'),
+              (10, 1, 3, 150.00, '2024-02-18 10:00:00', 'Complément épargne',       'execute'),
+              (4,  4, 3, 500.00, '2024-01-20 10:00:00', 'Épargne famille',          'execute'),
+              (6,  1, 2, 75.00,  '2024-01-10 09:00:00', 'Partage abonnement',       'execute'),
+              (5,  2, 1, 150.00, '2024-02-28 14:00:00', 'Remboursement restaurant', 'execute'),
+              (7,  4, 1, 200.00, '2024-02-25 11:30:00', 'Remboursement courses',    'annule')
+      - input: ref('stg_comptes')
+        format: sql
+        rows: |
+          select
+              column1::number(38, 0)   as compte_id,
+              column2::varchar         as nom_client,
+              column3::varchar         as email,
+              column4::varchar         as type_compte,
+              column5::date            as date_ouverture,
+              column6::number(12, 2)   as solde_initial,
+              column7::varchar         as statut
+          from values
+              (1, 'Alice Dupont', 'alice.dupont@email.fr', 'courant', '2023-01-15', 2500.00, 'actif'),
+              (2, 'Bob Martin',   'bob.martin@email.fr',   'courant', '2023-03-22', 1800.00, 'actif'),
+              (3, 'Claire Leroy', 'claire.leroy@email.fr', 'epargne', '2023-06-01', 5000.00, 'actif'),
+              (4, 'David Moreau', 'david.moreau@email.fr', 'joint',   '2022-11-10', 3200.00, 'actif')
+      - input: this
+        format: sql
+        rows: |
+          select
+              column1::varchar         as mouvement_id,
+              column2::number(38, 0)   as virement_id,
+              column3::varchar         as sens,
+              column4::number(38, 0)   as compte_id,
+              column5::varchar         as nom_client,
+              column6::varchar         as type_compte,
+              column7::number(38, 0)   as compte_contrepartie_id,
+              column8::varchar         as nom_client_contrepartie,
+              column9::number(38, 0)   as compte_source_id,
+              column10::number(38, 0)  as compte_destination_id,
+              column11::number(10, 2)  as montant,
+              column12::number(38, 0)  as montant_centimes,
+              column13::number(10, 2)  as montant_signe,
+              column14::number(38, 0)  as montant_signe_centimes,
+              column15::timestamp_ntz  as date_virement,
+              column16::varchar        as periode,
+              column17::varchar        as motif,
+              column18::varchar        as statut,
+              column19::timestamp_ntz  as date_chargement
+          from values
+              ('mvt-9-sortant',  9,  'sortant', 4, 'David Moreau', 'joint',   3, 'Claire Leroy', 4, 3, 500.00, 50000, -500.00, -50000, '2024-02-20 10:00:00', '2024-02', 'Épargne famille février', 'execute', '2024-02-21 05:00:00'),
+              ('mvt-9-entrant',  9,  'entrant', 3, 'Claire Leroy', 'epargne', 4, 'David Moreau', 4, 3, 500.00, 50000,  500.00,  50000, '2024-02-20 10:00:00', '2024-02', 'Épargne famille février', 'execute', '2024-02-21 05:00:00'),
+              ('mvt-10-sortant', 10, 'sortant', 1, 'Alice Dupont', 'courant', 3, 'Claire Leroy', 1, 3, 150.00, 15000, -150.00, -15000, '2024-02-18 10:00:00', '2024-02', 'Complément épargne',      'execute', '2024-02-21 05:00:00'),
+              ('mvt-10-entrant', 10, 'entrant', 3, 'Claire Leroy', 'epargne', 1, 'Alice Dupont', 1, 3, 150.00, 15000,  150.00,  15000, '2024-02-18 10:00:00', '2024-02', 'Complément épargne',      'execute', '2024-02-21 05:00:00'),
+              ('mvt-4-sortant',  4,  'sortant', 4, 'David Moreau', 'joint',   3, 'Claire Leroy', 4, 3, 500.00, 50000, -500.00, -50000, '2024-01-20 10:00:00', '2024-01', 'Épargne famille',         'execute', '2024-01-21 05:00:00'),
+              ('mvt-4-entrant',  4,  'entrant', 3, 'Claire Leroy', 'epargne', 4, 'David Moreau', 4, 3, 500.00, 50000,  500.00,  50000, '2024-01-20 10:00:00', '2024-01', 'Épargne famille',         'execute', '2024-01-21 05:00:00')
+    expect:
+      rows:
+        - {virement_id: 9, sens: sortant}
+        - {virement_id: 9, sens: entrant}
+        - {virement_id: 10, sens: sortant}
+        - {virement_id: 10, sens: entrant}
+        - {virement_id: 6, sens: sortant}
+        - {virement_id: 6, sens: entrant}
+        - {virement_id: 5, sens: sortant}
+        - {virement_id: 5, sens: entrant}

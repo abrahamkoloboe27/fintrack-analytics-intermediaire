@@ -20,7 +20,9 @@ select
     t.categorie_id,
     t.description,
     t.statut,
-    date_trunc('month', t.date_transaction)::date as mois_transaction,
+    -- Clé mensuelle commune à tout le projet ('YYYY-MM', Partie 5.2) :
+    -- remplace l'ancien date_trunc('month', ...)::date as mois_transaction
+    {{ generer_periode('t.date_transaction') }} as periode,
 
     c.nom_client,
     c.type_compte,
