@@ -8,7 +8,7 @@ protection de branche disponible) : sections 7 et 8.
 | Fichier | Rôle |
 |---|---|
 | `.github/workflows/ci.yml` | CI de chaque Pull Request vers `main` : validation puis build dans un schéma Snowflake éphémère |
-| `.github/workflows/cd.yml` | Production : déploiement à chaque push sur `main` (fusion d'une PR), runs planifiés (quotidien, hebdomadaire), lancement manuel |
+| `.github/workflows/cd.yml` | Production : déploiement à chaque push sur `main` (fusion d'une PR), runs planifiés (quotidien, hebdomadaire), lancement manuel ; publication de la documentation dbt sur GitHub Pages |
 | `.github/dependabot.yml` | Mises à jour hebdomadaires des actions GitHub (épinglées par SHA) et de dbt (`requirements.txt`) |
 | `ci/profiles.yml` | Profil dbt de la CI/CD (targets `ci` et `prod`). Versionné : il ne contient **aucun secret**, uniquement des `env_var()` |
 | `macros/supprimer_schema_ci.sql` | Opération qui supprime le schéma CI éphémère (garde-fous : target `ci` et schéma `CI_*` uniquement) |
@@ -23,11 +23,14 @@ Pull Request vers main ──► ci.yml
 
 Push sur main (fusion) ──► cd.yml : freshness → dbt build state:modified+ et vues de staging en amont,
                                     --full-refresh → artefacts : manifest, résultats, documentation
+                                    → si succès : documentation publiée sur GitHub Pages
 Chaque jour 05:15 UTC  ──► cd.yml : dbt build --selector daily
 Chaque lundi 04:15 UTC ──► cd.yml : dbt build --selector weekly
                                     + dbt build --select +config.materialized:incremental+ --full-refresh
 Lancement manuel       ──► cd.yml : sélecteur (tout / daily / weekly / critical) et --full-refresh au choix
 ```
+
+Documentation dbt de la production (mise à jour après chaque run de production réussi) : https://abrahamkoloboe27.github.io/fintrack-analytics-intermediaire/
 
 ---
 
@@ -272,7 +275,17 @@ connexion à Snowflake, plutôt que de redéployer un code ancien. Lancer alors 
 | `dbt-run-results-prod` | `run_results.json` (dernière commande dbt du run) et `sources.json` (fraîcheur) | 30 jours |
 | `dbt-docs` | `static_index.html` : documentation dbt complète (lineage compris) dans un seul fichier, produite par `dbt docs generate --static` | 30 jours |
 
-Consulter la documentation de la production :
+- **Documentation en ligne (GitHub Pages)** : après chaque run de production réussi, le job
+  `Documentation (GitHub Pages)` publie le même `static_index.html` (renommé `index.html`) sur
+  **https://abrahamkoloboe27.github.io/fintrack-analytics-intermediaire/**. Le site reflète donc
+  toujours le dernier état réellement déployé ; si le run de production échoue, il n'est pas mis à jour.
+  - Activation (déjà faite, une seule fois) : Settings → Pages → Source « GitHub Actions », ou
+    `gh api --method POST repos/$REPO/pages -f build_type=workflow`. GitHub crée alors
+    l'environnement `github-pages`, limité à la branche `main` : une PR ne peut pas publier.
+  - Le job n'a que les permissions `pages: write` et `id-token: write` (jeton OIDC exigé par
+    `actions/deploy-pages`) et ne reçoit aucun secret Snowflake.
+
+Télécharger une version précédente de la documentation (artefact `dbt-docs`, 30 jours) :
 
 ```bash
 RUN_ID=$(gh run list --repo "$REPO" --workflow cd.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
@@ -359,10 +372,12 @@ la comparaison d'états ne voit pas : macro `generate_schema_name`, configuratio
 
 - **Dépôt public** : le code, les logs des runs (conservés 90 jours) et les artefacts (14 à 90 jours,
   dont la documentation `dbt-docs` et le manifest de la production) sont lisibles par tout utilisateur
-  GitHub. C'est acceptable ici : les données sont fictives, GitHub masque la valeur des secrets dans
-  les logs (y compris le compte et l'utilisateur affichés par `dbt debug`), et aucun identifiant n'est
-  écrit dans le dépôt. À reconsidérer avant tout usage avec des données réelles (dépôt privé, ou pas
-  de documentation publiée en artefact).
+  GitHub, et la documentation dbt est publiée sur GitHub Pages (catalogue de la production : noms des
+  tables et colonnes, descriptions, SQL compilé, nombre de lignes ; aucune donnée). C'est acceptable
+  ici : les données sont fictives, GitHub masque la valeur des secrets dans les logs (y compris le
+  compte et l'utilisateur affichés par `dbt debug`), et aucun identifiant n'est écrit dans le dépôt ni
+  dans la documentation. À reconsidérer avant tout usage avec des données réelles (dépôt privé, pas de
+  documentation publiée en artefact ni sur Pages).
 - **Aucun secret dans le dépôt** : `ci/profiles.yml` ne contient que des `env_var()`. Le `.gitignore`
   exclut tout autre `profiles.yml` et les fichiers de clés. Les workflows n'affichent que des noms de
   secrets.
