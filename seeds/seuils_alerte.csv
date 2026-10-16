@@ -1,0 +1,4 @@
+code_alerte,seuil_pct,severite,description
+depassement_80,80,warning,Budget consommé à plus de 80%
+depassement_100,100,critical,Budget dépassé
+depassement_150,150,urgent,Budget dépassé de plus de 50%

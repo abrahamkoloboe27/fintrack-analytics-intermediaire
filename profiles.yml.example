@@ -1,0 +1,27 @@
+# ============================================================
+# FICHIER EXEMPLE — à copier vers ~/.dbt/profiles.yml
+# Remplacez les valeurs entre < > par vos informations
+# ============================================================
+
+fintrack_analytics:
+  target: dev
+  outputs:
+
+    dev:
+      type: snowflake
+      account: '<votre_compte>'           # ex : xy12345.eu-west-1
+      user: '<votre_utilisateur>'
+      password: '<votre_mot_de_passe>'
+      role: 'FINTRACK_ROLE'
+      database: 'FINTRACK_DB'
+      warehouse: 'FINTRACK_WH'
+      schema: 'DEV_VOTRENOM'              # schéma personnel pour le dev
+      threads: 2
+
+    # TODO (Partie 2 — Section 8.2) : configurer la target prod
+    # prod:
+    #   type: snowflake
+    #   account: '<votre_compte>'
+    #   ...
+    #   schema: 'MARTS'
+    #   threads: 4

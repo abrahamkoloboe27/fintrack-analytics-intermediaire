@@ -1,0 +1,7 @@
+groupe,ordre_affichage,priorite_dashboard
+Logement,1,haute
+Quotidien,2,haute
+Épargne,3,moyenne
+Loisirs,4,basse
+Revenus,5,info
+Divers,6,basse

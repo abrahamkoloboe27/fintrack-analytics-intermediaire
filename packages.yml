@@ -1,0 +1,7 @@
+packages:
+  - package: dbt-labs/dbt_utils
+    version: [">=1.0.0", "<2.0.0"]
+
+  # TODO (Partie 2 — Section 6.1) : ajouter dbt-expectations ici
+  - package: calogica/dbt_expectations
+  #   version: ...

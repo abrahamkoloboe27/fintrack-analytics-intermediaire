@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: fintrack_raw
+    database: FINTRACK_DB
+    schema: RAW
+    tables:
+      - name: raw_comptes
+        description: "Comptes bancaires des clients FinTrack"
+      - name: raw_transactions
+        description: "Transactions financières (débits et crédits)"
+      - name: raw_categories
+        description: "Catégories de transactions (dépenses et revenus)"
+      - name: raw_budgets
+        description: "Budgets mensuels définis par les clients"
+      - name: raw_virements
+        description: "Virements entre comptes internes FinTrack"
+      - name: raw_alertes
+        description: "Alertes de dépassement de budget"
