@@ -1,0 +1,28 @@
+version: 2
+
+# ============================================================
+# ANALYSES — documentation (visible dans dbt docs)
+# ============================================================
+# Une analyse est compilée par dbt mais jamais matérialisée : son SQL
+# est écrit dans target/compiled/ (dbt compile) ou exécuté à la demande
+# (dbt show). Le détail des définitions est dans l'en-tête du fichier SQL.
+# ============================================================
+
+analyses:
+  - name: retention_mensuelle
+    description: >-
+      Bonus 9.1 — Rétention mensuelle des comptes actifs. Un compte est actif le
+      mois M s'il a au moins une transaction validée (fct_transactions) ou au
+      moins un virement interne émis et exécuté (fct_virements, sens sortant).
+      Taux de rétention (M) = comptes actifs en M-1 ET en M / comptes actifs en M-1,
+      sur un calendrier mensuel continu (un mois sans activité compte 0 actif).
+
+
+      Deux vues, choisies avec la variable `vue_retention` :
+      `mensuelle` (défaut : actifs, retenus, nouveaux, réactivés, perdus, taux de
+      rétention et d'attrition par mois) ou `cohortes` (taux de rétention de chaque
+      cohorte, c'est-à-dire du mois de première activité, mois après mois).
+
+
+      Exécution : `dbt show -s retention_mensuelle --limit 50` ou
+      `dbt show -s retention_mensuelle --vars '{vue_retention: cohortes}' --limit 50`.
