@@ -1,0 +1,11 @@
+# Dépendances Python du projet (CI/CD GitHub Actions et poste local).
+# Versions de dbt-core et dbt-snowflake figées (identiques au poste local,
+# cf. dbt --version) : la CI valide la version de dbt utilisée en
+# développement. Les dépendances transitives (snowflake-connector-python,
+# dbt-adapters, cryptography...) sont résolues à l'installation et peuvent
+# différer d'un environnement à l'autre.
+# Installation : python -m pip install -r requirements.txt
+# Mises à jour proposées chaque semaine par Dependabot (.github/dependabot.yml),
+# dbt-core et dbt-snowflake ensemble.
+dbt-core==1.12.5
+dbt-snowflake==1.12.1

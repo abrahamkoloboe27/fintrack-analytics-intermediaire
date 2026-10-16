@@ -1,0 +1,49 @@
+# ============================================================
+# Dependabot — mises à jour hebdomadaires des dépendances
+# ============================================================
+# Chaque mise à jour arrive sous forme de Pull Request, contrôlée par la
+# CI (.github/workflows/ci.yml) avant toute fusion dans main.
+# Attention : les PR ouvertes par Dependabot n'ont pas accès aux secrets
+# Actions. Seul le job « validation » (dbt parse) s'y exécute ; le build
+# Snowflake est ignoré. Avant de fusionner une PR de montée de version de
+# dbt, la tester en local (pip install -r requirements.txt puis dbt build
+# en dev) ou lancer la CI à la main sur sa branche (ci/README.md, section 4).
+# Les actions des workflows sont épinglées sur le SHA complet d'un commit,
+# suivi d'un commentaire de version (# v7.0.1) : Dependabot met à jour les
+# deux ensemble.
+# Les packages dbt (packages.yml / package-lock.yml) ne sont pas gérés
+# par Dependabot : `dbt deps --upgrade` en local.
+# ============================================================
+
+version: 2
+
+updates:
+
+  # Actions utilisées par les workflows (actions/checkout, setup-python...)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-github:
+        patterns: ["*"]
+
+  # Dépendances Python (requirements.txt)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+    groups:
+      # dbt-core et dbt-snowflake évoluent ensemble : une seule PR.
+      dbt:
+        patterns: ["dbt-*"]
+    ignore:
+      # dbt 2.x (moteur Fusion) : migration à décider manuellement.
+      - dependency-name: "dbt-core"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "dbt-snowflake"
+        update-types: ["version-update:semver-major"]

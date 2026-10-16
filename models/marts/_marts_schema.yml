@@ -1,0 +1,325 @@
+version: 2
+
+# ============================================================
+# Marts : dimensions, agrégats mensuels et historique des comptes
+# (les faits fct_transactions / fct_virements sont décrits dans
+# _fct_schema.yml).
+# Syntaxe dbt >= 1.10 : `data_tests:`, arguments des tests génériques
+# sous `arguments:`, configuration des tests sous `config:`.
+# ============================================================
+
+models:
+  # ----------------------------------------------------------
+  # Dimensions
+  # ----------------------------------------------------------
+  - name: dim_comptes
+    description: >-
+      Dimension des comptes clients : une ligne par compte, dans son état courant
+      (pour l'historique des changements, voir dim_comptes_historique).
+    columns:
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - unique
+          - not_null
+      - name: nom_client
+        description: "Nom et prénom du titulaire du compte."
+      - name: email
+        description: "Adresse e-mail du client."
+      - name: type_compte
+        description: "Type de compte : courant, epargne ou joint."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['courant', 'epargne', 'joint']
+      - name: date_ouverture
+        description: "Date d'ouverture du compte."
+      - name: solde_initial
+        description: "Solde du compte à l'ouverture, en euros : point de départ du solde cumulé de mart_solde_mensuel."
+      - name: statut
+        description: "{{ doc('col_statut_compte') }}"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['actif', 'inactif', 'cloture']
+      - name: anciennete_jours
+        description: >-
+          Nombre de jours entre l'ouverture du compte et la date du dernier build du
+          modèle, en heure de Paris (quel que soit le fuseau horaire de la session
+          Snowflake). Valeur figée jusqu'au build suivant (quotidien).
+
+  - name: dim_categories
+    description: >-
+      Dimension des catégories de transactions, enrichie par le seed mapping_groupes :
+      ordre d'affichage et priorité dashboard du groupe de la catégorie.
+    columns:
+      - name: categorie_id
+        description: "Identifiant unique de la catégorie."
+        data_tests:
+          - unique
+          - not_null
+      - name: nom_categorie
+        description: "Libellé de la catégorie (ex : Loyer, Salaire)."
+      - name: type_categorie
+        description: "Nature de la catégorie : revenu ou depense."
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['revenu', 'depense']
+      - name: groupe
+        description: "Groupe de catégories (Logement, Quotidien, Épargne, Loisirs, Revenus, Divers) : clé de jointure avec le seed mapping_groupes."
+        data_tests:
+          - not_null
+      - name: ordre_affichage
+        description: >-
+          Ordre d'affichage du groupe dans les dashboards (seed mapping_groupes).
+          Null si le groupe de la catégorie est absent du seed : le test not_null
+          garantit que le référentiel couvre bien tous les groupes.
+        data_tests:
+          - not_null
+      - name: priorite_dashboard
+        description: "Niveau de mise en avant du groupe dans les dashboards (seed mapping_groupes) : haute, moyenne, basse ou info."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['haute', 'moyenne', 'basse', 'info']
+
+  - name: dim_comptes_historique
+    description: >-
+      Historique SCD Type 2 des comptes, construit à partir du snapshot snap_comptes :
+      une ligne par version d'un compte (changement de statut, d'e-mail ou de type de
+      compte), avec ses bornes de validité, un indicateur de version courante et la
+      durée de la version en jours. Vue : la durée de la version courante est
+      calculée au moment de la requête.
+    data_tests:
+      # Pour un même compte, les versions se succèdent sans chevauchement ni trou :
+      # la fin d'une version (valide_jusqu_a) est exactement le début de la suivante
+      # (même heure de snapshot). La version courante (valide_jusqu_a null) est
+      # bornée au 31/12/9999 pour le test.
+      # NB : un compte supprimé de la source puis recréé avec le même id
+      # (hard_deletes: invalidate) créerait un trou légitime, signalé par ce test.
+      - dbt_utils.mutually_exclusive_ranges:
+          name: dim_comptes_historique_versions_contigues_sans_chevauchement
+          arguments:
+            lower_bound_column: valide_depuis
+            upper_bound_column: "coalesce(valide_jusqu_a, '9999-12-31'::timestamp_ntz)"
+            partition_by: compte_id
+            gaps: not_allowed
+    columns:
+      - name: version_id
+        description: "Identifiant unique de la version (dbt_scd_id du snapshot)."
+        data_tests:
+          - unique
+          - not_null
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+          # Au plus une version courante par compte (zéro si le compte a été
+          # supprimé de la source : hard_deletes invalidate).
+          - dbt_expectations.expect_column_values_to_be_unique:
+              name: dim_comptes_historique_une_version_courante_par_compte
+              arguments:
+                row_condition: "est_version_courante"
+      - name: nom_client
+        description: "Nom et prénom du titulaire du compte (valeur de la version)."
+      - name: email
+        description: "Adresse e-mail du client pendant la période de validité de la version."
+      - name: type_compte
+        description: "Type de compte (courant, epargne, joint) pendant la période de validité de la version."
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['courant', 'epargne', 'joint']
+      - name: statut
+        description: "{{ doc('col_statut_compte') }}"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['actif', 'inactif', 'cloture']
+      - name: date_ouverture
+        description: "Date d'ouverture du compte."
+      - name: solde_initial
+        description: "Solde du compte à l'ouverture, en euros."
+      - name: valide_depuis
+        description: "Début de validité de la version (dbt_valid_from) : heure UTC (timestamp_ntz) du `dbt snapshot` qui l'a détectée."
+        data_tests:
+          - not_null
+      - name: valide_jusqu_a
+        description: >-
+          Fin de validité de la version (dbt_valid_to) : heure UTC (timestamp_ntz) du
+          `dbt snapshot` qui a détecté le changement suivant (ou la suppression du compte).
+          Null pour la version courante.
+      - name: est_version_courante
+        description: "Vrai pour la version actuellement en vigueur (valide_jusqu_a null)."
+        data_tests:
+          - not_null
+      - name: numero_version
+        description: "Rang de la version pour le compte, par ordre chronologique (1 = première version capturée par le snapshot)."
+        data_tests:
+          - not_null
+      - name: duree_jours
+        description: >-
+          Durée de la version en jours (datediff 'day' de Snowflake : nombre de changements
+          de date entre valide_depuis et valide_jusqu_a, ou l'instant de la requête pour la
+          version courante). Vaut 0 pour des snapshots exécutés le même jour.
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+
+  # ----------------------------------------------------------
+  # Agrégats mensuels
+  # ----------------------------------------------------------
+  - name: mart_budget_vs_reel
+    description: >-
+      Comparaison mensuelle budget prévu / dépenses réelles (débits validés) par compte et
+      par catégorie. Full outer join : les budgets sans dépense et les dépenses sans budget
+      sont conservés (montant manquant = 0).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - compte_id
+              - categorie_id
+              - periode
+      # Cohérence (Partie 6.2) : il y a dépassement si et seulement si l'écart est négatif.
+      - dbt_utils.expression_is_true:
+          name: mart_budget_vs_reel_depassement_coherent_avec_ecart
+          arguments:
+            expression: "depassement = (ecart < 0)"
+    columns:
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_comptes')
+                field: compte_id
+      - name: nom_client
+        description: "Nom et prénom du titulaire du compte."
+      - name: categorie_id
+        description: "Identifiant de la catégorie de dépense."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_categories')
+                field: categorie_id
+      - name: nom_categorie
+        description: "Libellé de la catégorie de dépense."
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+        data_tests:
+          - not_null
+      - name: mois
+        description: "Premier jour du mois de la période (type date), pratique pour les axes temporels des outils BI."
+        data_tests:
+          - not_null
+      - name: montant_prevu
+        description: "Budget prévu pour le mois, en euros (0 si aucun budget n'a été défini)."
+        data_tests:
+          - not_null
+          # Partie 6.2 : un budget n'est jamais négatif.
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+      - name: montant_reel
+        description: "Total des débits validés du mois dans la catégorie, en euros (0 si aucune dépense)."
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+      - name: ecart
+        description: "Budget restant : montant_prevu - montant_reel (négatif en cas de dépassement)."
+        data_tests:
+          - not_null
+      - name: depassement
+        description: "Vrai si les dépenses réelles dépassent le budget prévu (montant_reel > montant_prevu)."
+        data_tests:
+          - not_null
+      - name: taux_consommation_pct
+        description: "Part du budget consommée, en % arrondi à 0,1 (null si aucun budget n'a été défini)."
+
+  - name: mart_solde_mensuel
+    description: >-
+      Solde mensuel par compte : transactions validées (fct_transactions) et virements
+      internes exécutés (fct_virements) agrégés par mois, puis solde cumulé depuis le solde
+      initial du compte. Une ligne par compte et par mois ayant au moins un mouvement :
+      pour un mois sans mouvement, le solde de fin de mois d'un compte est le solde_cumule
+      de sa dernière période antérieure ; un compte sans aucun mouvement n'y figure pas
+      (son solde reste son solde_initial). Table reconstruite à chaque run (cumul sur tout
+      l'historique).
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - compte_id
+              - periode
+      - dbt_utils.expression_is_true:
+          name: mart_solde_mensuel_solde_net_mois_coherent
+          arguments:
+            expression: "solde_net_mois = solde_net_transactions + solde_net_virements"
+      - dbt_utils.expression_is_true:
+          name: mart_solde_mensuel_solde_net_transactions_coherent
+          arguments:
+            expression: "solde_net_transactions = total_credits - total_debits"
+      - dbt_utils.expression_is_true:
+          name: mart_solde_mensuel_solde_net_virements_coherent
+          arguments:
+            expression: "solde_net_virements = total_virements_entrants - total_virements_sortants"
+    columns:
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_comptes')
+                field: compte_id
+      - name: nom_client
+        description: "Nom et prénom du titulaire du compte."
+      - name: type_compte
+        description: "Type de compte : courant, epargne ou joint."
+        data_tests:
+          - not_null
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+        data_tests:
+          - not_null
+      - name: mois
+        description: "Premier jour du mois de la période (type date), pratique pour les axes temporels des outils BI."
+        data_tests:
+          - not_null
+      - name: total_credits
+        description: "Somme des crédits validés du mois, en euros."
+      - name: total_debits
+        description: "Somme des débits validés du mois, en euros (valeur positive)."
+      - name: total_virements_entrants
+        description: "Somme des virements internes exécutés reçus par le compte dans le mois, en euros."
+      - name: total_virements_sortants
+        description: "Somme des virements internes exécutés émis par le compte dans le mois, en euros (valeur positive)."
+      - name: solde_net_transactions
+        description: "Effet net des transactions du mois : total_credits - total_debits."
+      - name: solde_net_virements
+        description: "Effet net des virements du mois : total_virements_entrants - total_virements_sortants."
+      - name: solde_net_mois
+        description: "Variation totale du solde sur le mois : solde_net_transactions + solde_net_virements."
+      - name: solde_cumule
+        description: "Solde du compte en fin de mois : solde_initial + cumul des solde_net_mois jusqu'à la période incluse."
+        data_tests:
+          - not_null
+          # Partie 6.2 : conversion du test singulier tests/assert_solde_mensuel_positif.sql
+          # (supprimé) : un compte épargne n'a jamais de solde cumulé négatif.
+          - dbt_expectations.expect_column_values_to_be_between:
+              name: mart_solde_mensuel_epargne_solde_cumule_positif
+              arguments:
+                min_value: 0
+                row_condition: "type_compte = 'epargne'"

@@ -1,48 +1,303 @@
 version: 2
 
+# ============================================================
+# COUCHE STAGING — documentation et tests
+# ============================================================
+# 1 modèle par table source : renommage et nettoyage léger, sans
+# règle métier (les filtres de statut sont faits dans les marts).
+# Syntaxe des tests (dbt >= 1.10) : `data_tests:`, arguments du test
+# sous `arguments:`, configuration (severity, where...) sous `config:`.
+# ============================================================
+
 models:
   - name: stg_comptes
-    description: "Comptes clients nettoyés — renommage des colonnes, uniformisation du statut"
+    description: >-
+      Comptes clients nettoyés — 1 ligne par compte (état courant, sans
+      historique). Renommage des colonnes et uniformisation du statut en
+      minuscules. Source : raw_comptes.
     columns:
       - name: compte_id
-        description: "Identifiant unique du compte"
-        tests:
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
           - unique
           - not_null
+      - name: nom_client
+        description: "Nom complet du titulaire du compte"
+      - name: email
+        description: "Adresse e-mail du client (colonne surveillée par le snapshot snap_comptes)"
       - name: type_compte
-        tests:
+        description: "Type de compte : courant, epargne (compte d'épargne) ou joint"
+        data_tests:
+          - not_null
           - accepted_values:
-              values: ['courant', 'epargne', 'joint']
+              arguments:
+                values: ['courant', 'epargne', 'joint']
+      - name: date_ouverture
+        description: "Date d'ouverture du compte"
+      - name: solde_initial
+        description: "Solde du compte à l'ouverture, en euros : point de départ du solde cumulé de mart_solde_mensuel"
+        data_tests:
+          - not_null
       - name: statut
-        tests:
+        description: "{{ doc('col_statut_compte') }}"
+        data_tests:
+          - not_null
           - accepted_values:
-              values: ['actif', 'inactif', 'cloture']
+              arguments:
+                values: ['actif', 'inactif', 'cloture']
 
   - name: stg_transactions
-    description: "Transactions nettoyées avec montant signé calculé"
+    description: >-
+      Transactions nettoyées — 1 ligne par transaction, tous statuts confondus
+      (seules les transactions validées sont retenues dans fct_transactions).
+      Ajoute le montant signé : positif pour un crédit, négatif pour un débit.
+      Source : raw_transactions.
     columns:
       - name: transaction_id
-        tests:
+        description: "Identifiant unique de la transaction"
+        data_tests:
           - unique
           - not_null
       - name: compte_id
-        tests:
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
           - relationships:
-              to: ref('stg_comptes')
-              field: compte_id
+              arguments:
+                to: ref('stg_comptes')
+                field: compte_id
+      - name: date_transaction
+        description: "Date et heure de la transaction (timestamp sans fuseau, date métier)"
+        data_tests:
+          - not_null
+      - name: montant
+        description: "Montant de la transaction en euros, toujours positif : le sens est porté par type_operation"
+        data_tests:
+          - not_null
+      - name: type_operation
+        description: "Sens de l'opération : credit (entrée d'argent) ou debit (sortie d'argent)"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['credit', 'debit']
+      - name: categorie_id
+        description: "Catégorie de la transaction (référence stg_categories.categorie_id)"
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_categories')
+                field: categorie_id
+      - name: description
+        description: "Libellé libre de la transaction"
+      - name: statut
+        description: "Statut de traitement : validee, en_attente ou rejetee (une transaction en_attente peut être validée plus tard)"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['validee', 'en_attente', 'rejetee']
+      - name: montant_signe
+        description: "{{ doc('col_montant_signe') }}"
 
   - name: stg_categories
-    description: "Catégories de transactions nettoyées"
+    description: >-
+      Catégories de transactions nettoyées — 1 ligne par catégorie.
+      Source : raw_categories.
     columns:
       - name: categorie_id
-        tests:
+        description: "Identifiant unique de la catégorie"
+        data_tests:
           - unique
+          - not_null
+      - name: nom_categorie
+        description: "Libellé de la catégorie (ex. Loyer, Salaire)"
+        data_tests:
+          - not_null
+      - name: type_categorie
+        description: "Nature de la catégorie : revenu ou depense"
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['revenu', 'depense']
+      - name: groupe
+        description: "Groupe de catégories (ex. Logement, Épargne) : clé de jointure avec le seed mapping_groupes dans dim_categories"
+        data_tests:
           - not_null
 
   - name: stg_budgets
-    description: "Budgets mensuels nettoyés"
+    description: >-
+      Budgets mensuels nettoyés — 1 ligne par compte, catégorie et mois.
+      Source : raw_budgets.
+    data_tests:
+      # Un seul budget par compte, catégorie et mois : garantit le grain de mart_budget_vs_reel
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['compte_id', 'categorie_id', 'mois']
     columns:
       - name: budget_id
-        tests:
+        description: "Identifiant unique du budget"
+        data_tests:
           - unique
           - not_null
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_comptes')
+                field: compte_id
+      - name: categorie_id
+        description: "Catégorie budgétée (référence stg_categories.categorie_id)"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_categories')
+                field: categorie_id
+      - name: mois
+        description: "Mois du budget (date du 1er jour du mois)"
+        data_tests:
+          - not_null
+      - name: montant_prevu
+        description: "Montant prévu pour le mois, en euros, jamais négatif"
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+
+  # ---------------- Partie 2 — nouveaux modèles staging ----------------
+
+  - name: stg_virements
+    description: >-
+      Virements internes nettoyés — 1 ligne par ordre de virement entre deux
+      comptes FinTrack, tous statuts confondus (execute, en_attente, annule) :
+      seuls les virements exécutés sont retenus dans fct_virements.
+      Source : raw_virements.
+    data_tests:
+      # Un virement interne relie toujours deux comptes distincts
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "compte_source_id <> compte_destination_id"
+    columns:
+      - name: virement_id
+        description: "Identifiant unique du virement"
+        data_tests:
+          - unique
+          - not_null
+      - name: compte_source_id
+        description: "Compte débité par le virement (référence stg_comptes.compte_id)"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_comptes')
+                field: compte_id
+      - name: compte_destination_id
+        description: "Compte crédité par le virement (référence stg_comptes.compte_id ; compte_dest_id dans la source)"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_comptes')
+                field: compte_id
+      - name: montant
+        description: "Montant viré en euros, strictement positif"
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+                strictly: true
+      - name: date_virement
+        description: "Date et heure de l'ordre de virement (timestamp sans fuseau) : marqueur incrémental de fct_virements"
+        data_tests:
+          - not_null
+      - name: motif
+        description: "Motif libre saisi par le client ; NULL si absent ou vide à la source"
+        data_tests:
+          # Partie 5.3 : test générique maison, échoue si plus de 10 % des motifs sont NULL
+          - taux_null:
+              arguments:
+                seuil_pct: 10
+      - name: statut
+        description: "Statut du virement, normalisé en minuscules : execute, en_attente ou annule"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['execute', 'en_attente', 'annule']
+
+  - name: stg_alertes
+    description: >-
+      Alertes de dépassement de budget nettoyées — 1 ligne par alerte (compte,
+      catégorie, mois), enrichie avec le seed seuils_alerte (seuil, sévérité,
+      libellé) et le taux de consommation du budget. Source : raw_alertes.
+    data_tests:
+      # Cohérence avec le référentiel : une alerte n'est émise qu'une fois le seuil
+      # de son type atteint. En warn : signale l'incohérence sans bloquer la chaîne.
+      # Ce test ne compare l'alerte qu'à ses propres montants : la cohérence avec
+      # les débits validés est vérifiée par le test singulier
+      # assert_alertes_coherentes_avec_transactions (tests/).
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "taux_consommation_pct >= seuil_pct"
+          config:
+            severity: warn
+    columns:
+      - name: alerte_id
+        description: "Identifiant unique de l'alerte"
+        data_tests:
+          - unique
+          - not_null
+      - name: compte_id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_comptes')
+                field: compte_id
+      - name: categorie_id
+        description: "Catégorie budgétaire concernée (référence stg_categories.categorie_id)"
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_categories')
+                field: categorie_id
+      - name: mois
+        description: "Mois budgétaire concerné (date du 1er jour du mois)"
+      - name: periode
+        description: "{{ doc('col_periode') }}"
+        data_tests:
+          - not_null
+      - name: type_alerte
+        description: "Code du type d'alerte (ex. depassement_80), normalisé en minuscules : clé de jointure avec seuils_alerte.code_alerte"
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('seuils_alerte')
+                field: code_alerte
+      - name: seuil_pct
+        description: "Seuil de déclenchement du type d'alerte, en % du budget prévu (seed seuils_alerte)"
+      - name: severite
+        description: "Sévérité du type d'alerte : warning, critical ou urgent (seed seuils_alerte)"
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['warning', 'critical', 'urgent']
+      - name: description_alerte
+        description: "Libellé du type d'alerte (colonne description du seed seuils_alerte)"
+      - name: montant_prevu
+        description: "Budget prévu pour le mois, en euros, au moment de l'alerte"
+      - name: montant_reel
+        description: "Dépenses constatées sur le mois, en euros, au moment de l'alerte"
+      - name: taux_consommation_pct
+        description: "Taux de consommation du budget en % : 100 x montant_reel / montant_prevu, arrondi à 0,1 ; NULL si le budget prévu vaut 0"
+      - name: date_generation
+        description: "Date et heure de génération de l'alerte (timestamp sans fuseau)"
+      - name: est_acquittee
+        description: "Vrai si le client a pris connaissance de l'alerte (colonne acquittee de la source)"

@@ -1,0 +1,34 @@
+version: 2
+
+# ============================================================
+# TESTS SINGULIERS — documentation (visible dans dbt docs)
+# ============================================================
+# Un test singulier est une requête SQL de tests/ qui renvoie les
+# lignes en échec (aucune ligne = test réussi). Ce fichier ne fait que
+# les documenter (clé de premier niveau `data_tests:`) ; leur sévérité
+# reste déclarée dans le config() de chaque fichier SQL. Le détail
+# (cas connus, choix techniques) est dans l'en-tête de chaque fichier.
+# ============================================================
+
+data_tests:
+  - name: assert_virements_equilibres
+    description: >-
+      Chaque virement de fct_virements est équilibré (partie double) : exactement
+      deux mouvements, un sortant et un entrant, aux montants signés renseignés et de
+      somme nulle. Renvoie les virements en échec. Sévérité error : un virement à une
+      seule jambe fausserait les soldes des deux comptes dans mart_solde_mensuel.
+
+  - name: assert_virements_non_dupliques_dans_transactions
+    description: >-
+      Avertissement (sévérité warn) : transactions de fct_transactions qui reprennent
+      un virement interne de fct_virements (même compte, montant, horodatage et sens),
+      donc comptées deux fois dans mart_solde_mensuel. Cas connus : transaction 40 =
+      virement 4 (compte 4), transactions 41 à 43 = virements 1 à 3 (compte 3).
+
+  - name: assert_alertes_coherentes_avec_transactions
+    description: >-
+      Avertissement (sévérité warn) : alertes de stg_alertes dont montant_reel ne
+      correspond pas aux débits validés de fct_transactions (même compte, catégorie et
+      période, datés au plus tard à date_generation), ou dont le seuil n'était pas
+      atteint par ces débits. Cas connus : alertes 2, 4, 5 et 6 (seuil de 80 % jamais
+      atteint).

@@ -1,0 +1,122 @@
+version: 2
+
+# ============================================================
+# Documentation des macros du projet (visible dans dbt docs)
+# ============================================================
+# Les arguments sont listés dans l'ordre de la signature Jinja : dbt
+# (behavior flag validate_macro_args, actif par défaut) vérifie leurs
+# noms, leur nombre et leur type déclaré.
+
+macros:
+
+  - name: generate_schema_name
+    description: >-
+      Surcharge de la macro native de dbt qui choisit le schéma Snowflake de chaque
+      nœud (modèle, seed, snapshot, test). **Target `prod`** : le schéma personnalisé
+      (`+schema`) est utilisé tel quel (staging → STAGING, marts → MARTS,
+      raw → RAW pour les seeds, snapshots → SNAPSHOTS) ; sans schéma personnalisé,
+      le schéma de la target. **Toute autre target** (dev, ci...) : tout est créé
+      dans le schéma de la target (ex. DEV_ABRAHAM, CI_PR_12), ce qui isole
+      totalement le développement et la CI des données de production.
+    arguments:
+      - name: custom_schema_name
+        type: optional[string]
+        description: >-
+          Valeur de la config `schema` du nœud (ex. 'marts'), ou none si le nœud
+          n'en définit pas.
+      - name: node
+        type: optional[any]
+        description: >-
+          Nœud en cours de traitement, fourni par dbt. Non utilisé par la macro ;
+          peut valoir none (appel depuis un hook).
+
+  - name: convertir_centimes
+    description: >-
+      Convertit un montant en euros en centimes entiers. Renvoie l'expression SQL
+      `cast(round(<colonne> * 100, 0) as number(38, 0))`, sans alias : l'appelant
+      nomme la colonne (ex. `convertir_centimes('t.montant')` suivi de
+      `as montant_centimes`). NULL en entrée donne NULL.
+    arguments:
+      - name: colonne
+        type: string
+        description: >-
+          Nom de colonne ou expression SQL contenant un montant en euros
+          (ex. 't.montant'). Obligatoire.
+
+  - name: generer_periode
+    description: >-
+      Produit la clé mensuelle `periode` au format texte 'YYYY-MM' à partir d'une date
+      ou d'un timestamp. Renvoie l'expression SQL
+      `to_char(cast(<colonne_date> as date), 'YYYY-MM')`, sans alias. Remplace les
+      `date_trunc('month', ...)` manuels : tous les modèles mensuels partagent la même
+      clé de jointure. Pour obtenir le premier jour du mois :
+      `to_date(periode, 'YYYY-MM')`.
+    arguments:
+      - name: colonne_date
+        type: string
+        description: >-
+          Nom de colonne ou expression SQL de type DATE ou TIMESTAMP
+          (ex. 't.date_transaction'). Obligatoire.
+
+  - name: test_taux_null
+    description: >-
+      Test générique **`taux_null`** : échoue si le pourcentage de valeurs NULL de la
+      colonne testée dépasse `seuil_pct`. Une table vide passe le test. En cas
+      d'échec, renvoie une ligne (nb_lignes, nb_nulls, taux_null_pct, seuil_pct).
+      Utilisé sur `stg_virements.motif` avec un seuil de 10 %. Déclaration :
+      `data_tests: [{taux_null: {arguments: {seuil_pct: 10}}}]`.
+    arguments:
+      - name: model
+        type: relation
+        description: Relation testée, fournie automatiquement par dbt.
+      - name: column_name
+        type: string
+        description: Colonne testée, fournie automatiquement par dbt.
+      - name: seuil_pct
+        type: float
+        description: >-
+          Pourcentage maximal de valeurs NULL toléré, entre 0 et 100 (bornes
+          incluses). Contrôlé dès la compilation : une valeur absente, non
+          numérique ou hors bornes provoque une erreur explicite.
+
+  - name: journaliser_fin_run
+    description: >-
+      Hook `on-run-end` (dbt_project.yml). Pour les commandes run, build, seed,
+      snapshot et test, insère une ligne dans `dbt_run_log` du schéma « marts » de la
+      target (prod : FINTRACK_DB.MARTS.dbt_run_log ; dev / ci : schéma de la target,
+      table créée si absente) : run_id (invocation_id), started_at (début du run,
+      UTC), completed_at (fin, UTC), status (`error` si un nœud est en
+      error / fail / runtime error, sinon `warn` si un nœud est en warn, sinon
+      `success`) et nb_models (nombre de modèles traités). Écrit aussi un résumé
+      dans les logs. Pour toute autre commande (ex. `dbt source freshness`), renvoie
+      la requête neutre `select 1 as aucun_journal`.
+    arguments:
+      - name: results
+        type: list[any]
+        description: >-
+          Variable `results` du contexte on-run-end : liste des résultats
+          (RunResult) des nœuds exécutés, avec leur statut et leur nœud.
+
+  - name: journaliser_watermark
+    description: >-
+      Pre-hook de modèle incrémental (fct_transactions). Avant chaque run
+      incrémental, lit `max(<colonne>)` de la table existante, l'écrit dans les logs
+      et l'insère dans `dbt_watermark_log` (même base et même schéma que le modèle ;
+      table créée si absente) : run_id, modele, colonne_watermark, valeur_watermark,
+      journalise_le. Premier run, `--full-refresh` ou modèle non incrémental : simple
+      log et requête neutre `select 1 as aucun_watermark`.
+    arguments:
+      - name: colonne
+        type: string
+        description: >-
+          Colonne marqueur du modèle incrémental (ex. 'date_transaction').
+          Obligatoire.
+
+  - name: supprimer_schema_ci
+    description: >-
+      Opération de nettoyage de la CI (`dbt run-operation supprimer_schema_ci --target ci`),
+      lancée par le workflow GitHub Actions avant et après le build d'une pull request.
+      Supprime le schéma éphémère de la target (ex. FINTRACK_DB.CI_PR_12) et tout son
+      contenu ; aucune erreur s'il n'existe pas. Garde-fous : refuse toute target autre
+      que `ci` et tout schéma qui ne suit pas la convention `CI_...` : un schéma de dev
+      ou de production ne peut pas être supprimé par cette macro. Sans argument.

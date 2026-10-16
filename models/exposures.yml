@@ -1,0 +1,127 @@
+version: 2
+
+# ============================================================
+# EXPOSURES — consommateurs aval des marts (Partie 8.1)
+# ============================================================
+# Une exposure déclare un usage EXTERNE à dbt (dashboard, rapport,
+# application…) et les nœuds dont il dépend. Elle apparaît dans le
+# lignage de dbt docs et sert de point d'entrée pour la sélection :
+#   dbt build -s +exposure:suivi_budgetaire_client    # tout ce qui alimente le dashboard
+#   dbt ls -s +exposure:synthese_mensuelle --resource-type model
+# Une exposure n'est jamais exécutée : `dbt build` l'affiche en NO-OP.
+#
+# Syntaxe dbt >= 1.10 :
+#   - `tags` et `meta` se placent sous `config:` (au niveau racine, ils
+#     déclenchent l'avertissement PropertyMovedToConfigDeprecation) ;
+#   - `owner` n'accepte que `name` et `email` ;
+#   - `type` : dashboard | notebook | analysis | ml | application ;
+#   - `maturity` : high | medium | low ;
+#   - `name` en snake_case, `label` pour le libellé lisible.
+# Les URLs et adresses e-mail sont fictives (domaine réservé .example).
+# ============================================================
+
+exposures:
+
+  - name: suivi_budgetaire_client
+    label: "Suivi budgétaire client"
+    type: dashboard
+    maturity: high
+    url: https://metabase.fintrack.example/dashboard/12-suivi-budgetaire-client
+    description: >-
+      Dashboard Metabase utilisé par les conseillers clientèle et le support
+      pour suivre, client par client, la consommation de chaque budget mensuel
+      par catégorie : montant prévu, dépenses réelles, écart, taux de
+      consommation et dépassements.
+
+
+      **Questions couvertes** : quels clients dépassent leur budget ce mois-ci,
+      sur quelles catégories et de combien ? Le dépassement est-il ponctuel ou
+      récurrent ?
+
+
+      **Données** : `mart_budget_vs_reel` (grain compte × catégorie × période)
+      enrichi des informations client de `dim_comptes` (nom, type et statut du
+      compte). Rafraîchi après le run dbt quotidien (sélecteur `daily`).
+
+
+      **Données personnelles** : affiche le nom et l'e-mail des clients ;
+      accès restreint au groupe Metabase des conseillers.
+    depends_on:
+      - ref('mart_budget_vs_reel')
+      - ref('dim_comptes')
+    owner:
+      name: "Équipe Data FinTrack"
+      email: data@fintrack.example
+    config:
+      tags: ['metabase', 'budget']
+      meta:
+        outil: metabase
+        frequence: quotidienne
+        public: "conseillers clientèle, support"
+        donnees_personnelles: true
+
+  # Type « analysis » (choix justifié) : le livrable est un rapport analytique
+  # périodique, lu par des humains, sans interaction.
+  #   - dashboard   → réservé aux tableaux de bord interactifs (Metabase ci-dessus) ;
+  #   - application → un système opérationnel qui consomme les données
+  #                   (application mobile, reverse ETL…) ;
+  #   - notebook    → décrirait l'outil qui produit le rapport, pas le livrable ;
+  #   - ml          → un modèle de machine learning.
+  # Maturité « medium » : tant que des transactions doublonnent des virements
+  # (41-43 = virements 1-3 sur le compte 3, 40 = virement 4 sur le compte 4),
+  # le solde du compte 3 est surévalué et celui du compte 4 sous-évalué
+  # (cf. test en warn assert_virements_non_dupliques_dans_transactions).
+  - name: synthese_mensuelle
+    label: "Synthèse mensuelle"
+    type: analysis
+    maturity: medium
+    url: https://reporting.fintrack.example/rapports/synthese-mensuelle
+    description: >-
+      Rapport PDF généré automatiquement le premier jour ouvré de chaque mois
+      et envoyé par e-mail à la direction financière et au service client.
+      Il présente, pour le mois écoulé : l'évolution du solde de chaque compte
+      (solde net du mois, virements internes, solde cumulé), le détail des
+      opérations validées et la répartition des dépenses par catégorie et par
+      groupe, dans l'ordre d'affichage du référentiel `mapping_groupes`.
+
+
+      **Données** : `mart_solde_mensuel` (soldes mensuels par compte),
+      `fct_transactions` (opérations validées) et `dim_categories` (libellés,
+      groupes, ordre d'affichage).
+
+
+      **Mois sans mouvement** : `mart_solde_mensuel` ne contient une ligne que
+      pour les mois où le compte a eu au moins un mouvement. Le solde de fin de
+      mois d'un compte est donc le `solde_cumule` de sa dernière période
+      antérieure ou égale au mois du rapport :
+      `where periode <= :mois qualify row_number() over (partition by compte_id order by periode desc) = 1`.
+      Un compte sans aucun mouvement (ex. compte 6, clôturé) n'y figure pas :
+      son solde reste son solde initial (colonne `solde_initial` de
+      `dim_comptes`, qui ne fait pas partie des dépendances déclarées). Sur les
+      données d'exemple, le rapport de juin 2024 doit ainsi reprendre le
+      compte 3 (dernier mouvement en mars) et le compte 5 (dernier mouvement en
+      janvier).
+
+
+      **Point d'attention** : quatre transactions du jeu de données doublonnent
+      des virements internes. Les transactions 41 à 43 (crédits de 300 €)
+      reprennent les virements 1 à 3 : le solde cumulé du compte 3 est surévalué
+      de 300 € en janvier 2024, de 600 € en février, puis de 900 € à partir de
+      mars. La transaction 40 (débit de 500 €) reprend le virement 4 : le solde
+      du compte 4 est sous-évalué de 500 € à partir de janvier 2024. Anomalie
+      signalée par le test `assert_virements_non_dupliques_dans_transactions`
+      (sévérité warn).
+    depends_on:
+      - ref('mart_solde_mensuel')
+      - ref('fct_transactions')
+      - ref('dim_categories')
+    owner:
+      name: "Pôle Reporting — Équipe Data FinTrack"
+      email: reporting@fintrack.example
+    config:
+      tags: ['reporting', 'mensuel']
+      meta:
+        outil: "script Python planifié (export PDF envoyé par e-mail)"
+        frequence: mensuelle
+        public: "direction financière, service client"
+        donnees_personnelles: true

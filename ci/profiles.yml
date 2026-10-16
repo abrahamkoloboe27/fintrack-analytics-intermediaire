@@ -1,0 +1,86 @@
+# ============================================================
+# Profil dbt de la CI/CD GitHub Actions — versionné, AUCUN secret ici
+# ============================================================
+# Utilisé uniquement par .github/workflows/ci.yml et cd.yml, via la
+# variable d'environnement DBT_PROFILES_DIR=<dépôt>/ci. Le poste local
+# continue d'utiliser ~/.dbt/profiles.yml (jamais versionné).
+#
+# Toutes les valeurs sensibles sont lues dans des variables
+# d'environnement, alimentées par les secrets GitHub du dépôt
+# (Settings > Secrets and variables > Actions, cf. ci/README.md) :
+#   SNOWFLAKE_ACCOUNT                 identifiant du compte (orgname-accountname
+#                                     ou xy12345.eu-west-1)
+#   SNOWFLAKE_USER                    utilisateur de la CI/CD : aujourd'hui
+#                                     l'utilisateur existant (mot de passe), à
+#                                     terme l'utilisateur de service FINTRACK_CI
+#   SNOWFLAKE_PASSWORD                mot de passe (méthode actuelle, temporaire :
+#                                     utilisateur humain uniquement)
+#   SNOWFLAKE_PRIVATE_KEY             clé privée PEM (paire de clés, méthode cible :
+#                                     Snowflake impose progressivement un second
+#                                     facteur aux connexions par mot de passe)
+#   SNOWFLAKE_PRIVATE_KEY_PASSPHRASE  phrase de passe, si la clé est chiffrée
+# Renseigner le mot de passe OU la clé privée : si SNOWFLAKE_PRIVATE_KEY
+# est définie, le connecteur Snowflake utilise la paire de clés et
+# ignore le mot de passe. Une variable absente vaut '' (option ignorée).
+# État actuel et migration vers la paire de clés : ci/README.md, sections 2 et 3.
+#
+# Valeurs non sensibles, surchargeables par des variables GitHub :
+#   SNOWFLAKE_ROLE (FINTRACK_ROLE), SNOWFLAKE_WAREHOUSE (FINTRACK_WH),
+#   SNOWFLAKE_DATABASE (FINTRACK_DB).
+#
+# Targets :
+#   ci   : schéma éphémère DBT_CI_SCHEMA (CI_PR_<n> ou CI_RUN_<id>), créé
+#          par le build et supprimé en fin de job
+#          (dbt run-operation supprimer_schema_ci).
+#   prod : schéma de base MARTS ; generate_schema_name place les modèles
+#          dans STAGING / MARTS, les seeds dans RAW et le snapshot dans
+#          SNAPSHOTS.
+# La target par défaut est `ci` : une commande lancée sans --target ne
+# peut pas écrire en production (et échoue si DBT_CI_SCHEMA est absent).
+#
+# query_tag : chaque requête est étiquetée (target + identifiant du run
+# GitHub) pour retrouver son coût dans QUERY_HISTORY.
+#
+# Le nom du profil garde l'orthographe historique `finetrack_analytics`
+# (clé `profile:` de dbt_project.yml).
+# ============================================================
+
+finetrack_analytics:
+  target: ci
+  outputs:
+
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
+      private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY', '') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'FINTRACK_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'FINTRACK_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'FINTRACK_DB') }}"
+      schema: "{{ env_var('DBT_CI_SCHEMA') }}"
+      threads: 4
+      client_session_keep_alive: false
+      # Nouvelles tentatives sur erreurs réseau transitoires uniquement
+      # (une erreur d'authentification échoue immédiatement).
+      connect_retries: 3
+      connect_timeout: 10
+      query_tag: "dbt_fintrack_ci_{{ env_var('GITHUB_RUN_ID', 'local') }}"
+
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
+      private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY', '') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'FINTRACK_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'FINTRACK_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'FINTRACK_DB') }}"
+      schema: MARTS
+      threads: 4
+      client_session_keep_alive: false
+      connect_retries: 3
+      connect_timeout: 10
+      query_tag: "dbt_fintrack_prod_{{ env_var('GITHUB_RUN_ID', 'local') }}"

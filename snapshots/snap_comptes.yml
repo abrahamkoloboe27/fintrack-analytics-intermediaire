@@ -1,0 +1,97 @@
+version: 2
+
+# ============================================================
+# Snapshot des comptes — SCD Type 2 (Partie 2 — Section 4.1)
+# ============================================================
+# Syntaxe YAML (dbt >= 1.9) : plus de bloc Jinja « snapshot » dans
+# un fichier .sql. dbt génère lui-même « select * from <relation> »
+# et historise chaque ligne de raw_comptes.
+#
+# Stratégie `check` (et non `timestamp`) : raw_comptes ne possède
+# AUCUNE colonne fiable de date de mise à jour (pas d'updated_at) ;
+# on ne peut donc pas savoir quand une ligne a changé. À chaque
+# `dbt snapshot`, dbt compare les colonnes surveillées (check_cols)
+# de la source avec la version courante stockée : en cas d'écart, il
+# ferme l'ancienne version (dbt_valid_to = heure du snapshot) et en
+# ouvre une nouvelle (dbt_valid_from = même heure). Sur Snowflake,
+# cette heure est un timestamp_ntz en UTC (macro snapshot_get_time).
+#
+# Colonnes surveillées : statut, email, type_compte (demande du
+# support client). Un changement d'une autre colonne (nom_client,
+# solde_initial...) ne crée pas de nouvelle version.
+# On évite check_cols: all, plus coûteux et plus « bruyant ».
+#
+# hard_deletes: invalidate : si un compte disparaît de raw_comptes,
+# sa version courante est fermée (dbt_valid_to renseigné) au lieu de
+# rester « courante » indéfiniment (défaut : ignore).
+# Revers : une lecture vide de raw_comptes fermerait toutes les versions
+# courantes (une lecture partielle, celles des comptes absents), et dbt
+# ne dédoublonne pas la source : un id en double peut créer des versions
+# en double, ou qui basculent d'un run à l'autre. Garde-fous : les tests
+# de la source raw_comptes (_stg_sources.yml : au moins une ligne, id
+# unique et non null) s'exécutent avant le snapshot dans un dbt build et
+# le sautent en cas d'échec ; ils ne détectent pas une lecture partielle.
+# `dbt snapshot` seul ne lance aucun test.
+#
+# Schéma cible : volontairement absent d'ici. Il vient de
+# `+schema: snapshots` dans dbt_project.yml et passe par la macro
+# generate_schema_name (prod : SNAPSHOTS ; dev / ci : schéma de la
+# target). On n'utilise PAS l'ancien paramètre target_schema, qui
+# court-circuite generate_schema_name et écrirait au même endroit
+# quelle que soit la target (risque d'écraser l'historique de prod).
+#
+# Protocole de test : scripts/04_snapshot_updates.sql (Partie 4).
+# ============================================================
+
+snapshots:
+  - name: snap_comptes
+    relation: source('fintrack_raw', 'raw_comptes')
+    description: >-
+      Historique SCD Type 2 des comptes clients (source raw_comptes) : une ligne par
+      version d'un compte. Une nouvelle version est créée à chaque changement de statut,
+      d'e-mail ou de type de compte détecté par `dbt snapshot` (stratégie check).
+      La version courante a dbt_valid_to à null. Exposé aux utilisateurs via le modèle
+      dim_comptes_historique.
+    config:
+      strategy: check
+      unique_key: id
+      check_cols: ['statut', 'email', 'type_compte']
+      # Protégé en amont par les tests de la source raw_comptes (voir l'en-tête).
+      hard_deletes: invalidate
+      # Table PERMANENTE : par défaut, dbt-snowflake crée des tables
+      # TRANSIENT (pas de Fail-safe, Time Travel limité à 1 jour). Or
+      # l'historique d'un snapshot ne peut pas être reconstruit depuis
+      # la source : on garde la protection Time Travel / Fail-safe.
+      transient: false
+    columns:
+      - name: id
+        description: "{{ doc('col_compte_id') }}"
+        data_tests:
+          - not_null
+      - name: nom_client
+        description: "Nom et prénom du titulaire du compte (non surveillé par le snapshot)."
+      - name: email
+        description: "Adresse e-mail du client (colonne surveillée : un changement crée une version)."
+      - name: type_compte
+        description: "Type de compte : courant, epargne ou joint (colonne surveillée)."
+      - name: date_ouverture
+        description: "Date d'ouverture du compte."
+      - name: solde_initial
+        description: "Solde du compte à l'ouverture, en euros (non surveillé par le snapshot)."
+      - name: statut
+        description: "Statut du compte tel que stocké dans la source (colonne surveillée)."
+      - name: dbt_scd_id
+        description: "Identifiant technique unique de la version (hash de id et dbt_updated_at), généré par dbt."
+        data_tests:
+          - unique
+          - not_null
+      - name: dbt_updated_at
+        description: "Horodatage technique (UTC) utilisé par dbt pour la version ; égal à dbt_valid_from en stratégie check."
+      - name: dbt_valid_from
+        description: "Début de validité de la version : heure UTC (timestamp_ntz) du `dbt snapshot` qui l'a détectée."
+        data_tests:
+          - not_null
+      - name: dbt_valid_to
+        description: >-
+          Fin de validité de la version : heure UTC (timestamp_ntz) du `dbt snapshot` qui a détecté
+          le changement suivant ou la suppression du compte ; null pour la version courante.

@@ -1,0 +1,75 @@
+version: 2
+
+# ============================================================
+# SEEDS — données de référence versionnées (Partie 2)
+# ============================================================
+# Chargés par `dbt seed` : schéma RAW en prod, schéma de la target
+# en dev / CI (macro generate_schema_name).
+# Les types sont figés par `column_types` au lieu de l'inférence
+# automatique de dbt : longueurs VARCHAR explicites, entiers en
+# NUMBER(p, 0). Un changement de type impose `dbt seed --full-refresh`.
+# Fichiers CSV encodés en UTF-8 (accents, ex. « Épargne »).
+# ============================================================
+
+seeds:
+  - name: mapping_groupes
+    description: >-
+      Métadonnées d'affichage des groupes de catégories — 1 ligne par groupe :
+      ordre d'affichage et priorité dans les dashboards. Jointure avec
+      dim_categories sur la colonne groupe.
+    config:
+      column_types:
+        groupe: varchar(30)
+        ordre_affichage: number(3,0)
+        priorite_dashboard: varchar(10)
+    columns:
+      - name: groupe
+        description: "Nom du groupe de catégories (ex. Logement, Épargne), identique à raw_categories.groupe"
+        data_tests:
+          - unique
+          - not_null
+      - name: ordre_affichage
+        description: "Rang d'affichage du groupe dans les dashboards (1 = affiché en premier)"
+        data_tests:
+          - unique
+          - not_null
+      - name: priorite_dashboard
+        description: "Priorité du groupe dans les dashboards : haute, moyenne, basse ou info"
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['haute', 'moyenne', 'basse', 'info']
+
+  - name: seuils_alerte
+    description: >-
+      Référentiel des types d'alertes de dépassement de budget — 1 ligne par
+      type : seuil de déclenchement (en % du budget prévu) et sévérité.
+      Jointure avec stg_alertes sur code_alerte = type_alerte.
+    config:
+      column_types:
+        code_alerte: varchar(30)
+        seuil_pct: number(5,0)
+        severite: varchar(10)
+        description: varchar(255)
+    columns:
+      - name: code_alerte
+        description: "Code du type d'alerte (ex. depassement_80), clé du référentiel"
+        data_tests:
+          - unique
+          - not_null
+      - name: seuil_pct
+        description: "Seuil de déclenchement, en % du budget prévu (80 = budget consommé à 80 %)"
+        data_tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              arguments:
+                min_value: 0
+                strictly: true
+      - name: severite
+        description: "Sévérité de l'alerte : warning, critical ou urgent"
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['warning', 'critical', 'urgent']
+      - name: description
+        description: "Libellé lisible du type d'alerte, repris dans stg_alertes.description_alerte"

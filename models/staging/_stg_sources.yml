@@ -1,19 +1,218 @@
 version: 2
 
+# ============================================================
+# SOURCES BRUTES FINTRACK (FINTRACK_DB.RAW)
+# ============================================================
+# Tables alimentées hors dbt (scripts/02 et 03) : dbt les lit sans
+# jamais les modifier. database / schema sont fixés en dur : RAW est
+# le même pour toutes les targets (dev, ci, prod).
+#
+# Partie 6.3 — Fraîcheur des sources (`dbt source freshness`)
+# ------------------------------------------------------------
+# - raw_transactions et raw_virements doivent avoir été mises à jour
+#   dans les 48 dernières heures : warn au-delà de 24 h (alerte
+#   précoce), error au-delà de 48 h (exigence de la Partie 6.3).
+# - Syntaxe dbt >= 1.10 : `freshness` (comme `loaded_at_field`) se
+#   déclare sous `config:` ; la forme historique placée directement
+#   sous la table est dépréciée.
+# - Pas de `loaded_at_field` : RAW n'a aucune colonne d'horodatage de
+#   chargement, et date_transaction / date_virement sont des dates
+#   MÉTIER (historique 2024). Elles mesureraient l'activité des
+#   clients, pas l'ingestion, et seraient toujours en erreur.
+#   Sans loaded_at_field, dbt calcule la fraîcheur à partir des
+#   métadonnées Snowflake : INFORMATION_SCHEMA.TABLES.LAST_ALTERED,
+#   c.-à-d. la date de dernière mise à jour de la table (DML ou DDL),
+#   en une seule requête pour toutes les sources (support natif de
+#   dbt-snowflake). Limite : c'est une approximation de la date de
+#   chargement (un DDL sur la table la fait aussi avancer).
+# - « En production » : les seuils sont évalués par le job de prod
+#   (`dbt source freshness --target prod` dans la CD GitHub Actions).
+#   RAW étant partagé, le résultat est identique depuis une autre
+#   target. Sur ce jeu de données d'apprentissage, chargé une seule
+#   fois, le contrôle passe en error 48 h après le dernier chargement :
+#   c'est précisément l'alerte attendue.
+#
+# Tests de clé des sources (unique / not_null sur id)
+# ------------------------------------------------------------
+# - Sur les 6 tables : `id` n'a aucune contrainte dans RAW (ni clé
+#   primaire, ni NOT NULL ; Snowflake n'applique de toute façon pas
+#   l'unicité), et un double chargement s'est déjà produit (script 02
+#   rejoué : comptes, catégories, transactions et budgets en double,
+#   réparés par scripts/06_dedoublonnage_raw.sql).
+# - Avec le tag `daily` de la source, ces tests font partie du sélecteur
+#   daily. Dans un dbt build, ils s'exécutent AVANT les nœuds qui lisent
+#   la table (vues staging, snapshot) et les sautent en cas d'échec, avec
+#   un message qui désigne directement la table RAW. Coût négligeable :
+#   un GROUP BY par table.
+# - raw_comptes a en plus un test « au moins une ligne » (voir son
+#   commentaire : garde-fou du snapshot snap_comptes).
+# ============================================================
+
 sources:
   - name: fintrack_raw
+    description: >-
+      Données brutes de l'application FinTrack chargées dans FINTRACK_DB.RAW :
+      comptes, transactions, catégories, budgets (Partie 1), virements internes
+      et alertes de dépassement de budget (Partie 2). Lecture seule pour dbt ;
+      seule porte d'entrée de la couche staging.
     database: FINTRACK_DB
     schema: RAW
+    config:
+      # Bonus 9.2 : avec le tag `daily`, le sélecteur `daily` embarque aussi
+      # les tests de sources (sélection indirecte des tests)
+      tags: ['daily']
     tables:
       - name: raw_comptes
-        description: "Comptes bancaires des clients FinTrack"
+        description: "Comptes bancaires des clients FinTrack — 1 ligne par compte, état courant (pas d'historique : voir le snapshot snap_comptes)"
+        # Garde-fous du snapshot snap_comptes, qui lit cette table directement
+        # (hard_deletes: invalidate) et dont l'historique ne se reconstruit
+        # pas : une lecture vide fermerait toutes les versions courantes, un
+        # id en double peut créer des versions en double, ou qui basculent
+        # d'un run à l'autre. Dans un dbt build, ces tests passent avant le
+        # snapshot et le sautent en cas d'échec.
+        data_tests:
+          - dbt_expectations.expect_table_row_count_to_be_between:
+              arguments:
+                min_value: 1
+        columns:
+          - name: id
+            description: "Identifiant du compte (clé primaire de la source)"
+            data_tests:
+              - unique
+              - not_null
+          - name: nom_client
+            description: "Nom complet du titulaire du compte"
+          - name: email
+            description: "Adresse e-mail du client"
+          - name: type_compte
+            description: "Type de compte : courant, epargne ou joint"
+          - name: date_ouverture
+            description: "Date d'ouverture du compte"
+          - name: solde_initial
+            description: "Solde du compte à l'ouverture, en euros"
+          - name: statut
+            description: "Statut du compte tel que saisi à la source (actif, inactif, cloture), casse non garantie"
+
       - name: raw_transactions
-        description: "Transactions financières (débits et crédits)"
+        description: "Transactions financières (débits et crédits) des comptes clients — 1 ligne par transaction, tous statuts confondus"
+        config:
+          # Partie 6.3 : fraîcheur sur métadonnées Snowflake (voir l'en-tête)
+          freshness:
+            warn_after:
+              count: 24
+              period: hour
+            error_after:
+              count: 48
+              period: hour
+        columns:
+          - name: id
+            description: "Identifiant de la transaction (clé primaire de la source)"
+            # Clé vérifiée dès la source (voir l'en-tête)
+            data_tests:
+              - unique
+              - not_null
+          - name: compte_id
+            description: "Compte concerné (référence raw_comptes.id)"
+          - name: date_transaction
+            description: "Date et heure de la transaction (date métier, pas la date de chargement)"
+          - name: montant
+            description: "Montant en euros, toujours positif : le sens est porté par type_operation"
+          - name: type_operation
+            description: "Sens de l'opération : credit (entrée d'argent) ou debit (sortie d'argent)"
+          - name: categorie_id
+            description: "Catégorie de la transaction (référence raw_categories.id)"
+          - name: description
+            description: "Libellé libre de la transaction"
+          - name: statut
+            description: "Statut de traitement : validee, en_attente ou rejetee (une transaction en_attente peut être validée plus tard)"
+
       - name: raw_categories
-        description: "Catégories de transactions (dépenses et revenus)"
+        description: "Catégories de transactions (dépenses et revenus) — 1 ligne par catégorie"
+        columns:
+          - name: id
+            description: "Identifiant de la catégorie (clé primaire de la source)"
+            # Clé vérifiée dès la source (voir l'en-tête)
+            data_tests:
+              - unique
+              - not_null
+          - name: nom
+            description: "Libellé de la catégorie (ex. Loyer, Salaire)"
+          - name: type
+            description: "Nature de la catégorie : revenu ou depense"
+          - name: groupe
+            description: "Groupe de catégories (ex. Logement, Épargne), clé de jointure avec le seed mapping_groupes"
+
       - name: raw_budgets
-        description: "Budgets mensuels définis par les clients"
+        description: "Budgets mensuels définis par les clients — 1 ligne par compte, catégorie et mois"
+        columns:
+          - name: id
+            description: "Identifiant du budget (clé primaire de la source)"
+            # Clé vérifiée dès la source (voir l'en-tête)
+            data_tests:
+              - unique
+              - not_null
+          - name: compte_id
+            description: "Compte concerné (référence raw_comptes.id)"
+          - name: categorie_id
+            description: "Catégorie budgétée (référence raw_categories.id)"
+          - name: mois
+            description: "Mois du budget (date du 1er jour du mois)"
+          - name: montant_prevu
+            description: "Montant prévu pour le mois, en euros"
+
       - name: raw_virements
-        description: "Virements entre comptes internes FinTrack"
+        description: "Virements internes entre deux comptes FinTrack (Partie 2) — 1 ligne par ordre de virement, tous statuts confondus"
+        config:
+          # Partie 6.3 : même exigence que raw_transactions (voir l'en-tête)
+          freshness:
+            warn_after:
+              count: 24
+              period: hour
+            error_after:
+              count: 48
+              period: hour
+        columns:
+          - name: id
+            description: "Identifiant du virement (clé primaire de la source)"
+            # Nouvelle table de la Partie 2 : contrat d'interface vérifié dès la source
+            data_tests:
+              - unique
+              - not_null
+          - name: compte_source_id
+            description: "Compte débité (référence raw_comptes.id)"
+          - name: compte_dest_id
+            description: "Compte crédité (référence raw_comptes.id)"
+          - name: montant
+            description: "Montant viré en euros, toujours positif"
+          - name: date_virement
+            description: "Date et heure de l'ordre de virement (date métier)"
+          - name: motif
+            description: "Motif libre saisi par le client (peut être vide)"
+          - name: statut
+            description: "Statut du virement : execute, en_attente ou annule"
+
       - name: raw_alertes
-        description: "Alertes de dépassement de budget"
+        description: "Alertes de dépassement de budget générées par l'application (Partie 2) — 1 ligne par alerte"
+        columns:
+          - name: id
+            description: "Identifiant de l'alerte (clé primaire de la source)"
+            # Nouvelle table de la Partie 2 : contrat d'interface vérifié dès la source
+            data_tests:
+              - unique
+              - not_null
+          - name: compte_id
+            description: "Compte concerné (référence raw_comptes.id)"
+          - name: categorie_id
+            description: "Catégorie budgétaire concernée (référence raw_categories.id)"
+          - name: mois
+            description: "Mois budgétaire concerné (date du 1er jour du mois)"
+          - name: type_alerte
+            description: "Code du type d'alerte (référence seuils_alerte.code_alerte, ex. depassement_80)"
+          - name: montant_prevu
+            description: "Budget prévu pour le mois, en euros, au moment de l'alerte"
+          - name: montant_reel
+            description: "Dépenses constatées sur le mois, en euros, au moment de l'alerte"
+          - name: date_generation
+            description: "Date et heure de génération de l'alerte"
+          - name: acquittee
+            description: "Vrai si le client a pris connaissance de l'alerte"

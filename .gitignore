@@ -3,9 +3,18 @@ target/
 dbt_packages/
 logs/
 
-# Identifiants : ne jamais versionner le vrai profiles.yml (seul profiles.yml.example l'est)
+# Identifiants : ne jamais versionner un vrai profiles.yml, à quelque
+# niveau que ce soit (seul profiles.yml.example l'est)...
 profiles.yml
+# ... sauf le profil de la CI/CD : il ne contient que des appels
+# env_var(), alimentés par les secrets GitHub (aucun secret en clair).
+!/ci/profiles.yml
 .user.yml
+
+# Clés privées (authentification Snowflake par paire de clés, cf. ci/README.md)
+*.p8
+*.pem
+rsa_key*
 
 # Python / OS
 .venv/
