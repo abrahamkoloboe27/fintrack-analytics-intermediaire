@@ -1,0 +1,383 @@
+# ============================================================
+# CD — déploiement et exécutions planifiées en PRODUCTION (target prod)
+# ============================================================
+# Déclencheurs et commandes dbt :
+#   - push sur main (fusion d'une PR) : déploiement des nœuds modifiés et
+#     de leurs descendants, avec --full-refresh, par comparaison avec le
+#     manifest du dernier run de production réussi
+#       dbt build --select "state:modified+ @state:modified,config.materialized:view"
+#                 --full-refresh --state <manifest précédent>
+#     (la seconde partie ajoute les vues de staging en amont des nœuds
+#     modifiés, avec leurs tests).
+#     À défaut (premier déploiement, artefact expiré, dernier déploiement
+#     sur push en échec ou annulé) : reconstruction complète
+#     `dbt build --full-refresh`.
+#     Le --full-refresh est indispensable : les modèles incrémentaux sont
+#     en on_schema_change='fail', un changement de colonnes doit les recréer.
+#   - planifié, chaque jour à 05:15 UTC : dbt build --selector daily
+#   - planifié, chaque lundi à 04:15 UTC : dbt build --selector weekly,
+#     puis full refresh des modèles incrémentaux, de leurs descendants et
+#     de leurs vues de staging en amont (+config.materialized:incremental+).
+#     Il réconcilie les annulations, quelle que soit leur date, et les
+#     corrections hors de la fenêtre de recouvrement (lookback), cf.
+#     fct_transactions et fct_virements.
+#   - manuel (workflow_dispatch) : sélecteur et --full-refresh au choix
+#     (procédure du premier déploiement, cf. ci/README.md).
+#
+# Étapes communes : dbt source freshness (non bloquant : avertissement),
+# build, puis publication des artefacts :
+#   dbt-manifest-prod    manifest.json (état pour le slim CI et le prochain
+#                        déploiement), seulement si le build a réussi
+#   dbt-run-results-prod run_results.json + sources.json (toujours)
+#   dbt-docs             documentation autonome static_index.html
+#                        (dbt docs generate --static)
+#
+# Un seul run de production à la fois (groupe `dbt-prod`) : un run en
+# cours n'est jamais annulé, les suivants attendent leur tour (queue: max).
+# Une relance (« Re-run ») n'est acceptée que si main n'a pas avancé
+# depuis le run d'origine.
+# Documentation (secrets, premier déploiement, coûts) : ci/README.md
+# ============================================================
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Heures UTC. Minutes décalées de l'heure pile : en début d'heure,
+    # GitHub retarde (voire abandonne) des runs planifiés.
+    # Ces deux expressions sont reprises À L'IDENTIQUE dans l'étape
+    # « Déterminer le mode d'exécution » : les modifier aux deux endroits.
+    - cron: "15 5 * * *"   # quotidien : selector daily
+    - cron: "15 4 * * 1"   # hebdomadaire (lundi) : selector weekly + full refresh
+  workflow_dispatch:
+    inputs:
+      selector:
+        description: "Sélection à construire (tout = projet complet ; sinon sélecteur de selectors.yml)"
+        type: choice
+        options:
+          - tout
+          - daily
+          - weekly
+          - critical
+        default: tout
+      full_refresh:
+        description: "Ajouter --full-refresh (recrée les modèles incrémentaux et les seeds ; le snapshot n'est jamais effacé)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Un seul run de production à la fois ; les suivants attendent dans l'ordre
+# d'arrivée (queue: max, jusqu'à 100 en attente) : un run planifié ou manuel
+# n'annule jamais un déploiement en attente. Sans `queue: max`, GitHub ne
+# garde qu'UN run en attente par groupe et annule celui qui attendait.
+# actionlint 1.7.12 ne connaît pas encore la clé `queue` (faux positif) :
+#   actionlint -ignore 'unexpected key "queue" for "concurrency" section'
+concurrency:
+  group: dbt-prod
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Profil dbt versionné (aucun secret : uniquement des env_var()).
+  DBT_PROFILES_DIR: ${{ github.workspace }}/ci
+  DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+
+jobs:
+  production:
+    name: dbt production
+    # Garde-fou : un lancement manuel depuis une autre branche que main ne
+    # doit jamais déployer en production.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Lecture des runs et artefacts précédents de cd.yml (manifest).
+      actions: read
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+      # Variables GitHub facultatives. Le repli est fait ICI : une variable
+      # d'environnement vide ('') l'emporterait sur le défaut de env_var().
+      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE || 'FINTRACK_ROLE' }}
+      SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE || 'FINTRACK_WH' }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE || 'FINTRACK_DB' }}
+      # Pas de tests unitaires en production (recommandation dbt) : leurs
+      # données sont figées et déjà validées par la CI ; les exécuter ici
+      # créerait des tables temporaires dans MARTS sans rien apprendre.
+      # Les tests de données (data_tests) s'exécutent normalement.
+      DBT_EXCLUDE_RESOURCE_TYPES: unit_test
+    steps:
+      # Actions épinglées sur le SHA complet d'un commit (commentaire =
+      # version), tenues à jour par Dependabot : un tag déplacé ne peut pas
+      # modifier le code exécuté avec les secrets de production.
+      - name: Récupérer le code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installer Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Installer dbt (requirements.txt)
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          dbt --version
+
+      - name: Vérifier les secrets Snowflake (noms uniquement)
+        # En production, un secret manquant est une erreur explicite
+        # (jamais un déploiement silencieusement ignoré).
+        run: |
+          manquants=""
+          [ -n "${SNOWFLAKE_ACCOUNT}" ] || manquants="${manquants} SNOWFLAKE_ACCOUNT"
+          [ -n "${SNOWFLAKE_USER}" ] || manquants="${manquants} SNOWFLAKE_USER"
+          if [ -z "${SNOWFLAKE_PASSWORD}" ] && [ -z "${SNOWFLAKE_PRIVATE_KEY}" ]; then
+            manquants="${manquants} SNOWFLAKE_PRIVATE_KEY(ou SNOWFLAKE_PASSWORD)"
+          fi
+          if [ -n "${manquants}" ]; then
+            echo "::error title=Secrets Snowflake manquants::${manquants} — voir ci/README.md"
+            exit 1
+          fi
+
+      - name: Déterminer le mode d'exécution
+        id: mode
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+          # Lecture de la tête de main (contents: read suffit).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Relance (« Re-run ») d'un run : GitHub réutilise le commit
+          # d'origine. Si main a avancé depuis, ce run redéploierait l'ancien
+          # code (avec --full-refresh en mode déploiement) : refus explicite.
+          # Seules les relances sont contrôlées : les premières tentatives de
+          # runs plus anciens, en file d'attente (queue: max), se déploient
+          # dans l'ordre.
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+            tete_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)" || {
+              echo "::error::Tête de main illisible : relance refusée par prudence. Lancer un nouveau run : gh workflow run cd.yml --ref main."
+              exit 1
+            }
+            if [ "${GITHUB_SHA}" != "${tete_main}" ]; then
+              echo "::error::Relance d'un run ancien (${GITHUB_SHA}) : main est à ${tete_main}. Lancer un nouveau run : gh workflow run cd.yml --ref main."
+              exit 1
+            fi
+          fi
+          case "${EVENEMENT}" in
+            push)
+              mode="deploiement" ;;
+            schedule)
+              # Doit correspondre exactement aux expressions de `on.schedule`.
+              case "${CRON}" in
+                "15 5 * * *") mode="quotidien" ;;
+                "15 4 * * 1") mode="hebdomadaire" ;;
+                *)
+                  echo "::error::Expression cron inconnue « ${CRON} » : mettre à jour cette étape."
+                  exit 1 ;;
+              esac ;;
+            workflow_dispatch)
+              mode="manuel" ;;
+            *)
+              echo "::error::Événement non géré : ${EVENEMENT}"
+              exit 1 ;;
+          esac
+          echo "Mode d'exécution : ${mode}"
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Installer les packages dbt (package-lock.yml)
+        run: dbt deps
+
+      - name: Récupérer l'état de production précédent (manifest)
+        id: etat_prod
+        if: steps.mode.outputs.mode == 'deploiement'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dossier="${RUNNER_TEMP}/etat-prod-precedent"
+          etat="complet"
+          # 1. Le dernier déploiement déclenché par un push (le run courant,
+          #    encore en cours, n'est pas « completed ») a-t-il réussi ?
+          #    Sinon, une partie des changements précédents n'est peut-être
+          #    pas en production : reconstruction complète par sécurité.
+          dernier_push="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow cd.yml \
+            --branch main --event push --status completed --limit 1 \
+            --json conclusion --jq '.[0].conclusion // "aucun"' \
+            || echo "inconnu")"
+          echo "Conclusion du dernier déploiement sur push : ${dernier_push}"
+          if [ "${dernier_push}" = "success" ] || [ "${dernier_push}" = "aucun" ]; then
+            # 2. Manifest du dernier run de production réussi (push, planifié
+            #    ou manuel) : ces événements ne proviennent que du dépôt.
+            run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow cd.yml \
+              --branch main --status success --limit 20 --json databaseId,event \
+              --jq '[.[] | select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")][0].databaseId // empty' \
+              || true)"
+            if [ -n "${run_id}" ] \
+              && gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" \
+                   --name dbt-manifest-prod --dir "${dossier}" \
+              && [ -f "${dossier}/manifest.json" ]; then
+              etat="slim"
+              echo "Manifest de référence : run cd.yml ${run_id}."
+            fi
+          fi
+          if [ "${etat}" = "slim" ]; then
+            echo "Déploiement des seuls nœuds modifiés (state:modified+)."
+          else
+            echo "::notice title=Déploiement complet::Pas de manifest de production exploitable (premier déploiement, artefact expiré ou dernier déploiement non réussi) : dbt build --full-refresh de tout le projet."
+          fi
+          echo "etat=${etat}" >> "${GITHUB_OUTPUT}"
+          echo "dossier=${dossier}" >> "${GITHUB_OUTPUT}"
+
+      - name: Tester la connexion Snowflake
+        run: dbt debug --target prod --connection
+
+      - name: Fraîcheur des sources (non bloquant)
+        id: fraicheur
+        # Seuils définis dans models/staging/_stg_sources.yml (warn 24 h,
+        # error 48 h). Un retard ne bloque pas le build : il est signalé.
+        continue-on-error: true
+        run: dbt source freshness --target prod
+
+      - name: Signaler les sources en retard
+        env:
+          RESULTAT_FRAICHEUR: ${{ steps.fraicheur.outcome }}
+        run: |
+          if [ -f target/sources.json ]; then
+            jq -r '.results[] | select(.status != "pass") | "::warning title=Fraîcheur des sources::\(.unique_id) : statut \(.status)"' target/sources.json
+          fi
+          if [ "${RESULTAT_FRAICHEUR}" != "success" ]; then
+            echo "::warning title=Fraîcheur des sources::dbt source freshness a signalé au moins une source en erreur (> 48 h) ou n'a pas pu s'exécuter. Le build continue ; détail dans le log de l'étape précédente et dans l'artefact dbt-run-results-prod (sources.json)."
+          fi
+
+      - name: dbt build (${{ steps.mode.outputs.mode }})
+        id: build
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          ETAT: ${{ steps.etat_prod.outputs.etat }}
+          DOSSIER_ETAT: ${{ steps.etat_prod.outputs.dossier }}
+          SELECTEUR: ${{ inputs.selector }}
+          FULL_REFRESH: ${{ inputs.full_refresh }}
+        run: |
+          case "${MODE}" in
+            deploiement)
+              if [ "${ETAT}" = "slim" ]; then
+                # Nœuds modifiés et descendants, plus les VUES (staging) en
+                # amont des nœuds modifiés, pour embarquer leurs tests
+                # unique / not_null : dans un dbt build, un test ne bloque
+                # les nœuds en aval que s'il fait partie de la sélection, et
+                # ni le MERGE ni le --full-refresh (CTAS) ne contrôlent
+                # l'unicité des clés. Surtout pas `+state:modified+` : il
+                # embarquerait les seeds (DROP + CREATE avec --full-refresh)
+                # et le snapshot.
+                dbt build --target prod --full-refresh --state "${DOSSIER_ETAT}" \
+                  --select "state:modified+ @state:modified,config.materialized:view"
+              else
+                dbt build --target prod --full-refresh
+              fi
+              ;;
+            quotidien)
+              dbt build --target prod --selector daily
+              ;;
+            hebdomadaire)
+              # run_results.json publié = celui de la dernière commande.
+              dbt build --target prod --selector weekly
+              # Préfixe `+` : les ancêtres des modèles incrémentaux (sources,
+              # vues de staging recréées à l'identique ; aucun seed ni
+              # snapshot) entrent dans la sélection avec leurs tests unique /
+              # not_null, exécutés AVANT la reconstruction des faits (CTAS,
+              # sans contrôle des clés). En cas d'échec (ex. clé en double
+              # dans RAW), les faits ne sont pas reconstruits et gardent leur
+              # version précédente.
+              dbt build --target prod --select +config.materialized:incremental+ --full-refresh
+              ;;
+            manuel)
+              # Entrées transmises par variables d'environnement et validées
+              # (jamais interpolées directement dans le script).
+              commande=(build --target prod)
+              case "${SELECTEUR}" in
+                tout) ;;
+                daily|weekly|critical) commande+=(--selector "${SELECTEUR}") ;;
+                *)
+                  echo "::error::Sélecteur inconnu : ${SELECTEUR}"
+                  exit 1 ;;
+              esac
+              if [ "${FULL_REFRESH}" = "true" ]; then
+                commande+=(--full-refresh)
+              fi
+              echo "Commande : dbt ${commande[*]}"
+              dbt "${commande[@]}"
+              ;;
+            *)
+              echo "::error::Mode inconnu : ${MODE}"
+              exit 1 ;;
+          esac
+
+      - name: Résumé du run
+        if: always() && steps.build.outcome != 'skipped'
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          ETAT: ${{ steps.etat_prod.outputs.etat }}
+        run: |
+          {
+            echo "### dbt production : mode ${MODE}${ETAT:+ (${ETAT})}"
+            echo
+            if [ -f target/run_results.json ]; then
+              echo "| Statut | Nœuds |"
+              echo "|---|---|"
+              jq -r '.results | group_by(.status)[] | "| \(.[0].status) | \(length) |"' target/run_results.json
+              echo
+              jq -r '.results[] | select(.status == "error" or .status == "fail" or .status == "runtime error") | "- En échec : `\(.unique_id)`"' target/run_results.json
+            else
+              echo "Aucun fichier run_results.json produit."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Publier le manifest de production (état pour le slim CI)
+        # Uniquement si le build a réussi : ce manifest devient la référence
+        # « ce qui est en production » de la CI et du prochain déploiement.
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dbt-manifest-prod
+          path: target/manifest.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publier les résultats dbt (run_results.json, sources.json)
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dbt-run-results-prod
+          path: |
+            target/run_results.json
+            target/sources.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Générer la documentation statique (dbt docs generate --static)
+        # Dossier cible séparé : docs generate réécrit manifest.json et
+        # run_results.json, ceux du build doivent rester intacts dans target/.
+        run: dbt docs generate --static --target prod --target-path target/docs
+
+      - name: Publier la documentation (static_index.html)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dbt-docs
+          path: target/docs/static_index.html
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,320 @@
+# ============================================================
+# CI — validation des Pull Requests vers main (dbt + Snowflake)
+# ============================================================
+# Deux jobs :
+#   1. validation : installation, dbt deps, dbt parse (targets ci et prod)
+#      avec des identifiants FACTICES : aucun secret, aucune connexion à
+#      Snowflake. Échoue aussi à la moindre dépréciation dbt. S'exécute sur
+#      toutes les PR (forks et Dependabot compris).
+#   2. build-ci   : build réel dans un schéma Snowflake éphémère
+#      CI_PR_<numéro de PR> (target `ci`), supprimé en fin de job quoi
+#      qu'il arrive. Ignoré proprement (statut « skipped », qui ne bloque
+#      pas la PR) quand les secrets Snowflake sont indisponibles : PR
+#      depuis un fork, PR Dependabot, secrets pas encore créés.
+#
+# Slim CI : si le manifest de production est disponible (artefact
+# dbt-manifest-prod du dernier run réussi de cd.yml sur main), seuls les
+# nœuds modifiés par la PR et leurs descendants sont construits
+# (state:modified+) ; leurs parents non modifiés sont lus directement en
+# production (--defer). Sinon : build complet du projet dans le schéma CI.
+#
+# Seconde passe, incrémentale : les modèles incrémentaux de la sélection
+# (en build complet : avec leurs descendants) sont reconstruits une seconde
+# fois, sur les tables que la première passe vient de créer. Le chemin
+# incrémental (MERGE, contrôle on_schema_change, branche incrémentale du
+# pre-hook journaliser_watermark) est ainsi exécuté à chaque PR, et non
+# pour la première fois par le run quotidien de production.
+#
+# Pas de filtre `paths:` : un workflow ignoré par un filtre de chemins
+# laisse ses checks requis « en attente » et bloque la PR.
+#
+# Actions épinglées sur le SHA complet d'un commit (commentaire = version),
+# tenues à jour par Dependabot : un tag déplacé ne peut pas modifier le
+# code exécuté avec les secrets Snowflake (job build-ci).
+#
+# Documentation (secrets, premier déploiement, coûts) : ci/README.md
+# ============================================================
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Moindre privilège : lecture seule du code, sauf mention contraire par job.
+permissions:
+  contents: read
+
+# Un seul run CI à la fois par PR : un nouveau push annule le run en cours.
+# Les étapes `if: always()` du run annulé (dont la suppression du schéma
+# CI) s'exécutent quand même, avant le démarrage du nouveau run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Profil dbt versionné de la CI (aucun secret : uniquement des env_var()).
+  DBT_PROFILES_DIR: ${{ github.workspace }}/ci
+  DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+
+jobs:
+
+  # ----------------------------------------------------------
+  # Job 1 : validation statique, sans secret ni connexion
+  # ----------------------------------------------------------
+  validation:
+    name: Validation (dbt parse, sans connexion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      secrets_disponibles: ${{ steps.secrets.outputs.disponibles }}
+    env:
+      # Identifiants FACTICES : dbt parse charge le profil (rendu des
+      # env_var) mais n'ouvre jamais de connexion à Snowflake.
+      SNOWFLAKE_ACCOUNT: compte-factice
+      SNOWFLAKE_USER: utilisateur-factice
+      SNOWFLAKE_PASSWORD: mot-de-passe-factice
+      DBT_CI_SCHEMA: CI_VALIDATION
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installer Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Installer dbt (requirements.txt)
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          dbt --version
+
+      - name: Installer les packages dbt (package-lock.yml)
+        run: dbt deps
+
+      # Toute dépréciation dbt fait échouer la validation (projet sans
+      # dépréciation : elles deviennent des erreurs dans les versions
+      # suivantes). Pour seulement les afficher, retirer --warn-error-options.
+      - name: Parser le projet — target ci
+        run: |
+          dbt parse --target ci --no-partial-parse --show-all-deprecations \
+            --warn-error-options '{"error": ["Deprecations"]}'
+
+      - name: Parser le projet — target prod
+        run: |
+          dbt parse --target prod --no-partial-parse --show-all-deprecations \
+            --warn-error-options '{"error": ["Deprecations"]}'
+
+      - name: Détecter la présence des secrets Snowflake
+        id: secrets
+        env:
+          # Seul un booléen « présent / absent » est calculé : la valeur des
+          # secrets n'est jamais transmise à ce job.
+          AUTHENTIFICATION_PRESENTE: ${{ secrets.SNOWFLAKE_PASSWORD != '' || secrets.SNOWFLAKE_PRIVATE_KEY != '' }}
+        run: |
+          if [ "${AUTHENTIFICATION_PRESENTE}" = "true" ]; then
+            echo "disponibles=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "disponibles=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=Build CI ignoré::Secrets Snowflake indisponibles (PR depuis un fork, PR Dependabot ou secrets non créés) : seul le job de validation s'exécute. Voir ci/README.md."
+          fi
+
+  # ----------------------------------------------------------
+  # Job 2 : build dans un schéma Snowflake éphémère
+  # ----------------------------------------------------------
+  build-ci:
+    name: Build CI (schéma Snowflake éphémère)
+    needs: validation
+    if: needs.validation.outputs.secrets_disponibles == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Lecture des runs et artefacts de cd.yml (manifest de production).
+      actions: read
+    env:
+      # Schéma éphémère : CI_PR_<n> pour une PR, CI_RUN_<id> pour un
+      # lancement manuel. Seuls les schémas CI_* peuvent être supprimés
+      # par la macro supprimer_schema_ci.
+      DBT_CI_SCHEMA: ${{ github.event_name == 'pull_request' && format('CI_PR_{0}', github.event.pull_request.number) || format('CI_RUN_{0}', github.run_id) }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+      # Variables GitHub facultatives. Le repli est fait ICI : une variable
+      # d'environnement vide ('') l'emporterait sur le défaut de env_var().
+      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE || 'FINTRACK_ROLE' }}
+      SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE || 'FINTRACK_WH' }}
+      SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE || 'FINTRACK_DB' }}
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installer Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Installer dbt (requirements.txt)
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          dbt --version
+
+      - name: Vérifier les secrets Snowflake (noms uniquement)
+        run: |
+          manquants=""
+          [ -n "${SNOWFLAKE_ACCOUNT}" ] || manquants="${manquants} SNOWFLAKE_ACCOUNT"
+          [ -n "${SNOWFLAKE_USER}" ] || manquants="${manquants} SNOWFLAKE_USER"
+          if [ -z "${SNOWFLAKE_PASSWORD}" ] && [ -z "${SNOWFLAKE_PRIVATE_KEY}" ]; then
+            manquants="${manquants} SNOWFLAKE_PRIVATE_KEY(ou SNOWFLAKE_PASSWORD)"
+          fi
+          if [ -n "${manquants}" ]; then
+            echo "::error title=Secrets Snowflake manquants::${manquants} — voir ci/README.md"
+            exit 1
+          fi
+          echo "Schéma CI de ce run : ${DBT_CI_SCHEMA}"
+
+      - name: Installer les packages dbt (package-lock.yml)
+        id: deps
+        run: dbt deps
+
+      - name: Récupérer le manifest de production (slim CI)
+        id: etat_prod
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dossier="${RUNNER_TEMP}/etat-prod"
+          mode="complet"
+          # Dernier run RÉUSSI de cd.yml sur main. Seuls les événements
+          # push / schedule / workflow_dispatch sont retenus : ils ne peuvent
+          # provenir que du dépôt lui-même (jamais d'une PR ou d'un fork).
+          run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow cd.yml \
+            --branch main --status success --limit 20 --json databaseId,event \
+            --jq '[.[] | select(.event == "push" or .event == "schedule" or .event == "workflow_dispatch")][0].databaseId // empty' \
+            || true)"
+          if [ -n "${run_id}" ] \
+            && gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" \
+                 --name dbt-manifest-prod --dir "${dossier}" \
+            && [ -f "${dossier}/manifest.json" ]; then
+            mode="slim"
+            echo "Manifest de production récupéré (run cd.yml ${run_id}) : slim CI."
+          else
+            echo "::notice title=CI complète::Aucun manifest de production disponible (pas encore de déploiement réussi, ou artefact expiré) : build complet du projet."
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+          echo "dossier=${dossier}" >> "${GITHUB_OUTPUT}"
+
+      - name: Tester la connexion Snowflake
+        id: connexion
+        run: dbt debug --target ci --connection
+
+      - name: Préparer un schéma CI vide
+        # 1. Nettoyage préventif, au cas où un run précédent aurait été
+        #    interrompu : le build repart toujours d'un schéma vide.
+        # 2. Création explicite du schéma : dbt ne crée que les schémas des
+        #    modèles, seeds et snapshots sélectionnés, alors que les tests
+        #    unitaires y créent des tables temporaires (cas d'une PR qui ne
+        #    modifie qu'un test unitaire).
+        # --no-write-json : ne pas écraser les artefacts du dossier target/.
+        run: |
+          dbt run-operation supprimer_schema_ci --target ci --no-write-json
+          dbt run-operation --target ci --no-write-json \
+            --sql 'create schema if not exists {{ target.database }}.{{ target.schema }}'
+
+      - name: dbt build (${{ steps.etat_prod.outputs.mode }})
+        id: build
+        # Seconde passe (incrémentale) : les modèles incrémentaux existent
+        # désormais dans le schéma CI, is_incremental() est vrai (MERGE,
+        # contrôle on_schema_change, pre-hook journaliser_watermark). Tests
+        # unitaires exclus : déjà exécutés par la première passe. Dossier
+        # cible séparé : target/run_results.json reste celui de la première
+        # passe. Une passe en échec arrête l'étape (bash -e).
+        env:
+          MODE: ${{ steps.etat_prod.outputs.mode }}
+          DOSSIER_ETAT: ${{ steps.etat_prod.outputs.dossier }}
+        run: |
+          if [ "${MODE}" = "slim" ]; then
+            # Nœuds modifiés + descendants ; parents non modifiés lus en prod.
+            dbt build --target ci --select state:modified+ --defer --state "${DOSSIER_ETAT}"
+            # dbt build n'exécute un test unitaire qu'avec son modèle : un test
+            # unitaire modifié dont le modèle ne l'est pas serait ignoré.
+            echo "Tests unitaires modifiés seuls (« Nothing to do » = aucun) :"
+            dbt test --target ci --select "state:modified,test_type:unit" \
+              --defer --state "${DOSSIER_ETAT}" --no-write-json
+            echo "Seconde passe, incrémentale (« Nothing to do » = aucun modèle incrémental concerné) :"
+            dbt build --target ci --select "state:modified+,config.materialized:incremental" \
+              --defer --state "${DOSSIER_ETAT}" --exclude-resource-type unit_test \
+              --target-path target/passe_incrementale
+          else
+            # Projet complet (seeds, snapshot, modèles, tests unitaires et
+            # tests de données) dans le schéma CI.
+            dbt build --target ci
+            echo "Seconde passe, incrémentale : modèles incrémentaux et leurs descendants"
+            dbt build --target ci --select config.materialized:incremental+ \
+              --exclude-resource-type unit_test --target-path target/passe_incrementale
+          fi
+
+      - name: Résumé du build
+        if: always() && steps.build.outcome != 'skipped'
+        env:
+          MODE: ${{ steps.etat_prod.outputs.mode }}
+        run: |
+          # $1 = titre de la passe, $2 = run_results.json, $3 = message si absent
+          resumer_passe () {
+            echo
+            echo "#### $1"
+            echo
+            if [ ! -f "$2" ]; then
+              echo "$3"
+            elif [ "$(jq '.results | length' "$2")" -eq 0 ]; then
+              echo "Aucun nœud sélectionné (Nothing to do)."
+            else
+              echo "| Statut | Nœuds |"
+              echo "|---|---|"
+              jq -r '.results | group_by(.status)[] | "| \(.[0].status) | \(length) |"' "$2"
+              echo
+              jq -r '.results[] | select(.status == "error" or .status == "fail" or .status == "runtime error") | "- En échec : `\(.unique_id)`"' "$2"
+            fi
+          }
+          {
+            echo "### dbt build CI : schéma \`${DBT_CI_SCHEMA}\`, mode ${MODE:-inconnu}"
+            resumer_passe "Première passe : build" target/run_results.json \
+              "Aucun fichier run_results.json produit."
+            resumer_passe "Seconde passe : modèles incrémentaux (MERGE)" \
+              target/passe_incrementale/run_results.json \
+              "Non exécutée (première passe en échec ou run interrompu)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Publier les résultats dbt (run_results.json des deux passes)
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dbt-run-results-ci
+          # Dans l'artefact : run_results.json (première passe) et
+          # passe_incrementale/run_results.json (seconde passe).
+          path: |
+            target/run_results.json
+            target/passe_incrementale/run_results.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Supprimer le schéma CI (toujours)
+        # Exécutée même si le build échoue ou si le run est annulé, dès lors
+        # que la connexion a fonctionné (sinon rien n'a pu être créé).
+        if: always() && steps.deps.outcome == 'success' && steps.connexion.outcome == 'success'
+        run: dbt run-operation supprimer_schema_ci --target ci --no-write-json
